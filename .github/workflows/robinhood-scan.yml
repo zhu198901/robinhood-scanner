@@ -2,9 +2,8 @@ name: Robinhood Chain Scanner
 
 on:
   schedule:
-    # 每隔 5 分钟自动运行一次（你可以改成 */10 代表每 10 分钟）
     - cron: '*/5 * * * *'
-  workflow_dispatch: # 支持手动点击按钮触发测试
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -25,3 +24,5 @@ jobs:
       - name: Run scanner
         run: |
           python scanner.py
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
