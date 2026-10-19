@@ -18,16 +18,10 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: |
-          pip install web3 requests
+        run: pip install web3 requests
 
       - name: Run scanner
-        run: |
-                  python scanner.py
+        run: python scanner.py
         env:
           SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
           ALCHEMY_RPC_URL: ${{ secrets.ALCHEMY_RPC_URL }}
-
-          python scanner.py
-        env:
-          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
