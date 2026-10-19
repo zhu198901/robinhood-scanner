@@ -23,6 +23,11 @@ jobs:
 
       - name: Run scanner
         run: |
+                  python scanner.py
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+          ALCHEMY_RPC_URL: ${{ secrets.ALCHEMY_RPC_URL }}
+
           python scanner.py
         env:
           SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
