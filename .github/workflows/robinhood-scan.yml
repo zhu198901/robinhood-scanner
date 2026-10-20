@@ -1,0 +1,31 @@
+name: Robinhood Chain Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies and run scanner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install web3 requests
+          python scanner.py
+
+      - name: Send WeChat Notification
+        if: always()
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+        run: |
+          # 微信通知逻辑
