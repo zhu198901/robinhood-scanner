@@ -18,7 +18,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install web3 requests
+        run: pip install "web3<7" requests
 
       - name: Run scanner
         run: python scanner.py
