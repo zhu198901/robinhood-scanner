@@ -5,7 +5,6 @@ import os
 from datetime import datetime, timezone
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
-from web3.providers.persistent import WebSocketProvider
 
 CHAINS = {
     "Robinhood": {"rpc": "https://rpc.mainnet.chain.robinhood.com", "chain_id": 4663},
