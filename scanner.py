@@ -71,16 +71,16 @@ def send_notification(title, message):
         print("微信推送失败：", exc)
         return False
     def main():
-    w3 = Web3(Web3.HTTPProvider(
-        RPC_URL, request_kwargs={"timeout": 25}
+        w3 = Web3(Web3.HTTPProvider(
+            RPC_URL, request_kwargs={"timeout": 25}
     ))
 
-    if not w3.is_connected():
-        raise RuntimeError("Robinhood RPC连接失败")
+        if not w3.is_connected():
+            raise RuntimeError("Robinhood RPC连接失败")
 
-    chain_id = w3.eth.chain_id
-    print("RPC连接成功，Chain ID =", chain_id)
-    if chain_id != CHAIN_ID:
+        chain_id = w3.eth.chain_id
+         print("RPC连接成功，Chain ID =", chain_id)
+        if chain_id != CHAIN_ID:
         raise RuntimeError(f"链ID不匹配：{chain_id}")
 
     latest = w3.eth.block_number
