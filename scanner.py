@@ -17,7 +17,7 @@ CHAIN_ID = 4663
 STATE_FILE = Path("state.json")
 
 INITIAL_LOOKBACK = int(os.getenv("INITIAL_LOOKBACK_BLOCKS", "1200"))
-CHUNK_SIZE = int(os.getenv("LOG_CHUNK_SIZE", "50"))
+CHUNK_SIZE = int(os.getenv("LOG_CHUNK_SIZE", "10"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "300000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "100000"))
 MAX_PUSHES = int(os.getenv("MAX_CANDIDATES_PER_RUN", "12"))
