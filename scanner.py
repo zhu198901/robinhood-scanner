@@ -12,11 +12,11 @@ SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "").strip()
 
 CHAIN_ID = 4663
 STATE_FILE = Path("state.json")
-INITIAL_LOOKBACK = int(os.getenv("INITIAL_LOOKBACK_BLOCKS", "120"))
+INITIAL_LOOKBACK = max(10, int(os.getenv("INITIAL_LOOKBACK_BLOCKS", "120")))
 CHUNK_SIZE = 10
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "300000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "100000"))
-MAX_PUSHES = int(os.getenv("MAX_CANDIDATES_PER_RUN", "12"))
+MAX_PUSHES = max(1, int(os.getenv("MAX_CANDIDATES_PER_RUN", "12")))
 TIMEOUT = 20
 
 FACTORIES = {
@@ -24,12 +24,13 @@ FACTORIES = {
     "SushiSwap V3": "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
 }
 
-POOL_TOPIC = Web3.keccak(
-    text="PoolCreated(address,address,uint24,int24,address)"
-).hex()
+# Explicitly use Web3.to_hex to guarantee a 0x-prefixed topic.
+POOL_TOPIC = Web3.to_hex(
+    Web3.keccak(text="PoolCreated(address,address,uint24,int24,address)")
+)
 
 session = requests.Session()
-session.headers.update({"User-Agent": "RobinhoodReadOnlyScanner/1.2"})
+session.headers.update({"User-Agent": "RobinhoodReadOnlyScanner/1.3"})
 
 
 def log(message):
@@ -47,34 +48,30 @@ def rpc(method, params):
         },
         timeout=TIMEOUT,
     )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"HTTP {response.status_code}: {response.text[:1000]}"
-        )
-
+    response.raise_for_status()
     data = response.json()
 
     if data.get("error"):
         error = data["error"]
         raise RuntimeError(
-            f"RPC code={error.get('code')}: "
+            f"RPC {method} code={error.get('code')}: "
             f"{error.get('message', str(error))}"
         )
 
     if "result" not in data:
-        raise RuntimeError(f"RPC 响应格式异常：{str(data)[:500]}")
+        raise RuntimeError(f"RPC 响应缺少 result：{str(data)[:500]}")
 
     return data["result"]
 
 
 def topic_address(topic):
-    return Web3.to_checksum_address("0x" + topic[-40:])
+    value = topic if topic.startswith("0x") else "0x" + topic
+    return Web3.to_checksum_address("0x" + value[-40:])
 
 
-def data_address(data, index):
+def data_address(data, word_index):
     raw = data[2:] if data.startswith("0x") else data
-    word = raw[index * 64:(index + 1) * 64]
+    word = raw[word_index * 64:(word_index + 1) * 64]
 
     if len(word) != 64 or int(word, 16) == 0:
         return ""
@@ -84,9 +81,11 @@ def data_address(data, index):
 
 def load_state():
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            state.setdefault("last_block", None)
+            state.setdefault("seen", [])
+            return state
     except (OSError, ValueError):
         pass
 
@@ -102,7 +101,14 @@ def save_state(state):
 
 
 def get_logs(start, end, factory):
-    # JSON-RPC block quantities must be 0x-prefixed hex strings.
+    if start < 0 or end < start:
+        raise ValueError(f"区块范围不合法：{start}-{end}")
+
+    if end - start + 1 > CHUNK_SIZE:
+        raise ValueError(
+            f"单次查询超过 {CHUNK_SIZE} 个区块：{start}-{end}"
+        )
+
     params = [{
         "fromBlock": hex(start),
         "toBlock": hex(end),
@@ -110,53 +116,60 @@ def get_logs(start, end, factory):
         "topics": [POOL_TOPIC],
     }]
 
-    return rpc("eth_getLogs", params)
+    return rpc("eth_getLogs", params) or []
 
 
 def discover(start, end):
-    pools = []
+    found = []
 
     for block_start in range(start, end + 1, CHUNK_SIZE):
         block_end = min(end, block_start + CHUNK_SIZE - 1)
 
-        for dex, factory in FACTORIES.items():
+        log(f"正在查询区块 {block_start}-{block_end}")
+
+        for dex_name, factory in FACTORIES.items():
             try:
                 events = get_logs(block_start, block_end, factory)
 
                 for event in events:
                     topics = event.get("topics", [])
-                    if len(topics) < 3:
+                    if len(topics) < 4:
                         continue
 
                     token0 = topic_address(topics[1])
                     token1 = topic_address(topics[2])
 
-                    # PoolCreated data words:
-                    # 0 = fee, 1 = tick spacing, 2 = pool address.
+                    # PoolCreated:
+                    # topics[3] = indexed fee
+                    # data word 0 = tickSpacing
+                    # data word 1 = pool address
                     pool_address = data_address(
-                        event.get("data", "0x"), 2
+                        event.get("data", "0x"), 1
                     )
 
-                    if not pool_address or token0.lower() == token1.lower():
+                    if not pool_address:
                         continue
 
-                    pools.append({
-                        "dex": dex,
+                    if token0.lower() == token1.lower():
+                        continue
+
+                    found.append({
+                        "dex": dex_name,
                         "token0": token0,
                         "token1": token1,
                         "pool": pool_address,
-                        "block": int(event.get("blockNumber", "0x0"), 16),
+                        "block": int(event["blockNumber"], 16),
                         "tx": event.get("transactionHash", ""),
                         "log_index": int(event.get("logIndex", "0x0"), 16),
                     })
 
             except Exception as exc:
-                # Stop immediately: do not spend hours retrying bad requests.
                 raise RuntimeError(
-                    f"{dex} 区块 {block_start}-{block_end} 查询失败：{exc}"
+                    f"{dex_name} 查询区块 {block_start}-{block_end} 失败："
+                    f"{exc}"
                 ) from exc
 
-    return pools
+    return found
 
 
 def market_pairs(token):
@@ -164,21 +177,30 @@ def market_pairs(token):
 
     try:
         response = session.get(url, timeout=TIMEOUT)
-        if not response.ok:
-            log(f"行情接口 HTTP {response.status_code}：{response.text[:200]}")
+
+        if response.status_code == 429:
+            log("Dexscreener 请求过于频繁，暂时跳过该代币")
             return []
 
-        payload = response.json()
-        results = []
+        response.raise_for_status()
+        data = response.json()
+        pairs = []
 
-        for pair in payload.get("pairs") or []:
-            if "robinhood" not in str(pair.get("chainId", "")).lower():
+        for pair in data.get("pairs") or []:
+            chain = str(pair.get("chainId", "")).lower()
+
+            # Only accept pairs identified by the API as Robinhood Chain.
+            if "robinhood" not in chain:
                 continue
 
-            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
-            volume = float((pair.get("volume") or {}).get("h24") or 0)
+            liquidity = float(
+                (pair.get("liquidity") or {}).get("usd") or 0
+            )
+            volume = float(
+                (pair.get("volume") or {}).get("h24") or 0
+            )
 
-            results.append({
+            pairs.append({
                 "pair": pair.get("pairAddress", ""),
                 "dex": pair.get("dexId", "unknown"),
                 "url": pair.get("url", ""),
@@ -189,7 +211,7 @@ def market_pairs(token):
                 "volume": volume,
             })
 
-        return results
+        return pairs
 
     except Exception as exc:
         log(f"行情查询失败 {token}：{exc}")
@@ -209,18 +231,19 @@ def send_wechat(title, body):
             data={"title": title[:100], "desp": body},
             timeout=TIMEOUT,
         )
-
-        if not response.ok:
-            log(f"Server酱 HTTP {response.status_code}：{response.text[:300]}")
-            return False
-
+        response.raise_for_status()
         result = response.json()
+
         success = (
             result.get("code") == 0
             or (result.get("data") or {}).get("errno") == 0
         )
 
-        log("微信推送成功" if success else f"微信推送失败：{result}")
+        if success:
+            log("微信推送成功")
+        else:
+            log(f"微信推送失败：{result}")
+
         return success
 
     except Exception as exc:
@@ -230,28 +253,33 @@ def send_wechat(title, body):
 
 def main():
     if not RPC_URL:
-        raise SystemExit("缺少 GitHub Secret ALCHEMY_RPC_URL")
+        raise RuntimeError("缺少 GitHub Secret：ALCHEMY_RPC_URL")
 
-    chain_id = int(rpc("eth_chainId", []), 16)
+    chain_result = rpc("eth_chainId", [])
+    chain_id = int(chain_result, 16)
+
     if chain_id != CHAIN_ID:
-        raise SystemExit(f"链 ID 不匹配：{chain_id}")
+        raise RuntimeError(
+            f"链 ID 不匹配：期望 {CHAIN_ID}，实际 {chain_id}"
+        )
 
     latest = int(rpc("eth_blockNumber", []), 16)
     state = load_state()
-    last_block = state.get("last_block")
+    previous = state.get("last_block")
 
-    if last_block is None:
+    if previous is None:
         start = max(0, latest - INITIAL_LOOKBACK + 1)
     else:
-        start = int(last_block) + 1
+        start = int(previous) + 1
 
     log(f"Robinhood Chain 连接成功，最新区块：{latest}")
+    log(f"事件主题：{POOL_TOPIC}")
 
     if start > latest:
-        log("没有新块需要扫描")
+        log("没有新区块需要扫描")
         return
 
-    log(f"扫描区块范围：{start} - {latest}")
+    log(f"扫描区块范围：{start}-{latest}")
     pools = discover(start, latest)
     log(f"发现新池事件：{len(pools)}")
 
@@ -260,23 +288,29 @@ def main():
 
     for pool in pools:
         event_id = f"{pool['tx']}:{pool['log_index']}"
+
         if event_id in seen:
             continue
 
         seen.add(event_id)
 
         for token in (pool["token0"], pool["token1"]):
+            pairs = market_pairs(token)
+
             eligible = [
-                p for p in market_pairs(token)
-                if p["liquidity"] >= MIN_LIQUIDITY_USD
-                and p["volume"] >= MIN_VOLUME_24H_USD
+                pair for pair in pairs
+                if pair["liquidity"] >= MIN_LIQUIDITY_USD
+                and pair["volume"] >= MIN_VOLUME_24H_USD
             ]
 
             if not eligible:
                 continue
 
             eligible.sort(
-                key=lambda p: (p["liquidity"], p["volume"]),
+                key=lambda pair: (
+                    pair["liquidity"],
+                    pair["volume"],
+                ),
                 reverse=True,
             )
             pair = eligible[0]
@@ -292,10 +326,11 @@ def main():
                 f"流动性 USD：{pair['liquidity']:.2f}\n"
                 f"24小时成交量 USD：{pair['volume']:.2f}\n"
                 f"行情链接：{pair['url']}\n"
-                f"区块：{pool['block']}\n"
-                f"交易：{pool['tx']}\n\n"
-                "仅为候选提醒，尚未完成合约安全、税费、"
-                "持币集中度和流动性锁定检查；不自动买卖。"
+                f"创建区块：{pool['block']}\n"
+                f"交易哈希：{pool['tx']}\n\n"
+                "注意：这只是候选提醒，不代表安全或值得买入。"
+                "尚未验证合约税费、貔貅风险、持币集中度及 LP 锁定。"
+                "本程序只读，不会自动买入或卖出。"
             )
 
             if send_wechat(title, body):
@@ -311,7 +346,10 @@ def main():
     state["seen"] = list(seen)[-10000:]
     save_state(state)
 
-    log(f"扫描完成：新池事件 {len(pools)}，成功推送 {pushed} 条")
+    log(
+        f"扫描完成：新池事件 {len(pools)}，"
+        f"成功推送 {pushed} 条"
+    )
 
 
 if __name__ == "__main__":
