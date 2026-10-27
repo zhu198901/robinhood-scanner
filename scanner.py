@@ -8,35 +8,41 @@ from pathlib import Path
 import requests
 from web3 import Web3
 
-
 # ============================================================
 # Robinhood Chain Scanner
-# 只扫描、筛选、推送候选币，不会自动买入
+# Read-only: scan new V3 pools and send candidate alerts to WeChat.
 # ============================================================
 
-CHAIN_ID = 4663
 RPC_URL = os.getenv("ALCHEMY_RPC_URL", "").strip()
 SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "").strip()
 
+CHAIN_ID = 4663
 STATE_FILE = Path("state.json")
 
-# Alchemy 免费档：每次 eth_getLogs 最多查询 10 个区块
+FACTORIES = [
+    "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+    "0x221A6239E40709792b0d4bdc140fA36158CD41C7",
+]
+
+# V3 PoolCreated(address,address,uint24,int24,address)
+POOL_CREATED_TOPIC = Web3.keccak(
+    text="PoolCreated(address,address,uint24,int24,address)"
+).hex()
+
+# Scan limits
 CHUNK_SIZE = 10
-
-# 每次 GitHub Actions 尽量扫描 3000 个区块
-MAX_BLOCKS_PER_RUN = 3000
-
-REQUEST_TIMEOUT = 20
-RPC_MIN_INTERVAL = 0.25
-MAX_RETRIES = 5
-MAX_PUSHES = 8
-
-# 当落后超过这个区块数时，跳到最新区块附近恢复实时监控。
-# 注意：跳转会跳过未扫描的历史区块。
+MAX_BLOCKS_PER_RUN = 300
 MAX_LAG_BLOCKS = 50000
-STARTUP_LOOKBACK_BLOCKS = 300
+MAX_PUSHES = 8
+MAX_PENDING_EVENTS = 3000
+MAX_SEEN_EVENTS = 10000
 
-# 候选币筛选条件
+# RPC/API request pacing
+RPC_MIN_INTERVAL = 0.8
+REQUEST_TIMEOUT = 20
+MAX_RETRIES = 5
+
+# Candidate filters
 MIN_LIQUIDITY_USD = 300000
 MIN_VOLUME_24H_USD = 100000
 MIN_TXNS_24H = 20
@@ -44,50 +50,36 @@ MIN_BUY_SELL_RATIO = 0.80
 MAX_VOLUME_LIQUIDITY_RATIO = 5.0
 MAX_PAIR_AGE_DAYS = 3
 
-FACTORIES = [
-    Web3.to_checksum_address(
-        "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
-    ),
-    Web3.to_checksum_address(
-        "0x221A6239E40709792b0d4bdc140fA36158CD41C7"
-    ),
-]
-
-POOL_TOPIC = Web3.to_hex(
-    Web3.keccak(
-        text="PoolCreated(address,address,uint24,int24,address)"
-    )
-)
+# Pending events with no market data are retried for up to 24 hours.
+PENDING_MAX_AGE_SECONDS = 24 * 60 * 60
 
 session = requests.Session()
 last_rpc_request = 0.0
 
 
-# ============================================================
-# RPC
-# ============================================================
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
-def rpc(method, params):
+
+def rpc(method, params=None):
     global last_rpc_request
 
     if not RPC_URL:
         raise RuntimeError(
-            "缺少 ALCHEMY_RPC_URL，请检查 GitHub Secrets。"
+            "Missing GitHub Secret: ALCHEMY_RPC_URL"
         )
 
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
-        "params": params,
+        "params": params or [],
     }
 
     for attempt in range(MAX_RETRIES):
-        elapsed = time.monotonic() - last_rpc_request
-        if elapsed < RPC_MIN_INTERVAL:
-            time.sleep(RPC_MIN_INTERVAL - elapsed)
-
-        last_rpc_request = time.monotonic()
+        wait = RPC_MIN_INTERVAL - (time.monotonic() - last_rpc_request)
+        if wait > 0:
+            time.sleep(wait)
 
         try:
             response = session.post(
@@ -95,67 +87,45 @@ def rpc(method, params):
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
+            last_rpc_request = time.monotonic()
 
-            if response.status_code == 429:
-                wait = min(2 ** attempt, 20)
-                print(f"RPC 限流，{wait} 秒后重试")
-                time.sleep(wait)
-                continue
-
-            if response.status_code >= 500:
-                wait = min(2 ** attempt, 20)
-                print(f"RPC 服务错误 {response.status_code}，重试")
-                time.sleep(wait)
+            if response.status_code == 429 or response.status_code >= 500:
+                delay = min(2 ** attempt, 20)
+                log(f"RPC HTTP {response.status_code}; retry in {delay}s")
+                time.sleep(delay)
                 continue
 
             response.raise_for_status()
-            data = response.json()
+            body = response.json()
 
-            if "error" in data:
-                error = data["error"]
+            if body.get("error"):
+                error = body["error"]
                 message = str(error.get("message", error))
+                code = error.get("code")
 
-                if (
-                    "-32005" in str(error)
-                    or "rate limit" in message.lower()
-                    or "too many requests" in message.lower()
-                ):
-                    wait = min(2 ** attempt, 20)
-                    print(f"RPC 暂时限流，{wait} 秒后重试")
-                    time.sleep(wait)
+                if code == -32005 or "rate limit" in message.lower():
+                    delay = min(2 ** attempt, 20)
+                    log(f"RPC rate limit; retry in {delay}s")
+                    time.sleep(delay)
                     continue
 
-                raise RuntimeError(
-                    f"RPC {method} 失败：{message}"
-                )
+                raise RuntimeError(f"RPC {method} error: {error}")
 
-            if "result" not in data:
-                raise RuntimeError(
-                    f"RPC {method} 返回格式异常"
-                )
+            if "result" not in body:
+                raise RuntimeError(f"RPC {method}: missing result")
 
-            return data["result"]
+            return body["result"]
 
-        except requests.RequestException as exc:
-            wait = min(2 ** attempt, 20)
-            print(
-                f"RPC 网络错误，第 {attempt + 1} 次尝试：{exc}"
-            )
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(wait)
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == MAX_RETRIES - 1:
+                raise RuntimeError(f"RPC {method} failed: {exc}") from exc
 
-        except ValueError as exc:
-            wait = min(2 ** attempt, 20)
-            print(f"RPC 返回内容无法解析：{exc}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(wait)
+            delay = min(2 ** attempt, 20)
+            log(f"RPC request failed: {exc}; retry in {delay}s")
+            time.sleep(delay)
 
-    raise RuntimeError(f"RPC {method} 多次失败，停止本轮扫描")
+    raise RuntimeError(f"RPC {method} exhausted retries")
 
-
-# ============================================================
-# 状态保存
-# ============================================================
 
 def load_state():
     if not STATE_FILE.exists():
@@ -163,60 +133,73 @@ def load_state():
             "last_block": None,
             "seen": [],
             "pending": [],
+            "skipped_ranges": [],
         }
 
     try:
-        with STATE_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("state root is not an object")
 
-        return {
-            "last_block": data.get("last_block"),
-            "seen": list(data.get("seen", [])),
-            "pending": list(data.get("pending", [])),
-        }
+        data.setdefault("last_block", None)
+        data.setdefault("seen", [])
+        data.setdefault("pending", [])
+        data.setdefault("skipped_ranges", [])
 
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"读取扫描状态失败：{exc}")
-        print("为避免误用损坏状态，将从最新区块附近启动。")
-        return {
-            "last_block": None,
-            "seen": [],
-            "pending": [],
-        }
+        if not isinstance(data["seen"], list):
+            data["seen"] = []
+        if not isinstance(data["pending"], list):
+            data["pending"] = []
+        if not isinstance(data["skipped_ranges"], list):
+            data["skipped_ranges"] = []
+
+        return data
+
+    except Exception as exc:
+        # Do not silently overwrite a corrupt state file.
+        raise RuntimeError(
+            f"Cannot read {STATE_FILE}: {exc}. "
+            "Stop to protect the existing scan state."
+        ) from exc
 
 
 def save_state(state):
-    state["seen"] = list(dict.fromkeys(state["seen"]))[-20000:]
-    state["pending"] = list(
-        dict.fromkeys(state["pending"])
-    )[-10000:]
+    state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN_EVENTS:]
+    state["pending"] = state["pending"][-MAX_PENDING_EVENTS:]
+    state["skipped_ranges"] = state["skipped_ranges"][-100:]
 
     temp_file = STATE_FILE.with_suffix(".tmp")
-
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False)
-
+    temp_file.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     temp_file.replace(STATE_FILE)
 
 
-# ============================================================
-# 区块事件解析
-# ============================================================
-
 def address_from_topic(topic):
-    value = topic[-40:]
-    return Web3.to_checksum_address("0x" + value)
+    if not topic or len(topic) < 42:
+        return None
+    try:
+        return Web3.to_checksum_address("0x" + topic[-40:])
+    except Exception:
+        return None
 
 
 def address_from_data(data, word_index):
-    raw = data[2:] if data.startswith("0x") else data
+    if not isinstance(data, str) or not data.startswith("0x"):
+        return None
+
+    raw = data[2:]
     start = word_index * 64
     word = raw[start:start + 64]
 
     if len(word) != 64:
         return None
 
-    return Web3.to_checksum_address("0x" + word[-40:])
+    try:
+        return Web3.to_checksum_address("0x" + word[-40:])
+    except Exception:
+        return None
 
 
 def get_pool_events(start_block, end_block):
@@ -224,61 +207,85 @@ def get_pool_events(start_block, end_block):
         return []
 
     if end_block - start_block + 1 > CHUNK_SIZE:
-        raise ValueError(
-            f"查询范围超过限制：{start_block} - {end_block}"
-        )
+        raise ValueError("eth_getLogs chunk exceeds CHUNK_SIZE")
 
-    logs = rpc(
+    result = rpc(
         "eth_getLogs",
         [{
             "fromBlock": hex(start_block),
             "toBlock": hex(end_block),
             "address": FACTORIES,
-            "topics": [POOL_TOPIC],
+            "topics": [POOL_CREATED_TOPIC],
         }],
     )
 
     events = []
 
-    for log in logs:
-        topics = log.get("topics", [])
-
+    for item in result:
+        topics = item.get("topics", [])
         if len(topics) < 3:
             continue
 
         token0 = address_from_topic(topics[1])
         token1 = address_from_topic(topics[2])
 
-        # Uniswap V3 PoolCreated 的 data：
-        # word 0 = tickSpacing，word 1 = pool address
-        pool_address = address_from_data(log.get("data", ""), 1)
+        # V3 PoolCreated data words:
+        # word 0 = tickSpacing, word 1 = pool address
+        pool_address = address_from_data(item.get("data", ""), 1)
 
-        if not pool_address:
+        if not token0 or not token1 or not pool_address:
+            log("Warning: ignored malformed PoolCreated event")
             continue
 
-        event = {
-            "event_id": (
-                str(log.get("transactionHash", ""))
-                + ":"
-                + str(log.get("logIndex", ""))
-            ),
+        tx_hash = item.get("transactionHash", "")
+        log_index = int(item.get("logIndex", "0x0"), 16)
+        block_number = int(item.get("blockNumber", "0x0"), 16)
+
+        if not tx_hash:
+            continue
+
+        event_id = f"{tx_hash.lower()}:{log_index}"
+
+        events.append({
+            "id": event_id,
+            "block": block_number,
+            "tx": tx_hash,
+            "log_index": log_index,
+            "pool": pool_address,
             "token0": token0,
             "token1": token1,
-            "pool": pool_address,
-            "block": int(log["blockNumber"], 16),
-            "tx": log.get("transactionHash", ""),
-        }
-
-        events.append(event)
+            "first_seen": int(time.time()),
+        })
 
     return events
 
 
-# ============================================================
-# DexScreener 行情查询
-# ============================================================
+def add_pending_events(state, events):
+    existing = {
+        item.get("id")
+        for item in state["pending"]
+        if isinstance(item, dict)
+    }
+    seen = set(state["seen"])
 
-def get_market_pairs(tokens):
+    for event in events:
+        event_id = event["id"]
+        if event_id in existing or event_id in seen:
+            continue
+
+        state["pending"].append(event)
+        existing.add(event_id)
+
+    if len(state["pending"]) > MAX_PENDING_EVENTS:
+        log(
+            "ERROR: pending queue exceeded its safety limit. "
+            "Some newest events cannot be retained."
+        )
+        state["pending"] = state["pending"][-MAX_PENDING_EVENTS:]
+
+
+def fetch_market_pairs(tokens):
+    """Return (pairs, success). False means data retrieval was incomplete."""
     tokens = list(dict.fromkeys(
         token.lower() for token in tokens if token
     ))
@@ -287,8 +294,9 @@ def get_market_pairs(tokens):
         return [], True
 
     all_pairs = []
-    success_count = 0
+    all_succeeded = True
 
+    # DexScreener tokens endpoint supports batches of token addresses.
     for offset in range(0, len(tokens), 30):
         batch = tokens[offset:offset + 30]
         url = (
@@ -296,424 +304,442 @@ def get_market_pairs(tokens):
             + ",".join(batch)
         )
 
-        succeeded = False
+        success = False
 
-        for attempt in range(4):
+        for attempt in range(3):
             try:
-                response = session.get(
-                    url,
-                    timeout=REQUEST_TIMEOUT,
-                )
+                response = session.get(url, timeout=REQUEST_TIMEOUT)
 
-                if response.status_code == 429:
-                    time.sleep(min(2 ** attempt, 15))
+                if response.status_code == 429 or response.status_code >= 500:
+                    time.sleep(min(2 ** attempt, 10))
                     continue
 
                 response.raise_for_status()
-                result = response.json()
+                data = response.json()
 
-                if not isinstance(result, list):
-                    raise ValueError("行情接口返回格式异常")
+                if isinstance(data, list):
+                    all_pairs.extend(data)
+                    success = True
+                    break
 
-                all_pairs.extend(result)
-                success_count += 1
-                succeeded = True
+                log("Market API returned an unexpected response format")
                 break
 
-            except (
-                requests.RequestException,
-                ValueError,
-            ) as exc:
-                print(f"DexScreener 查询失败：{exc}")
-                if attempt < 3:
-                    time.sleep(min(2 ** attempt, 15))
+            except (requests.RequestException, ValueError) as exc:
+                log(f"Market API batch request failed: {exc}")
+                time.sleep(min(2 ** attempt, 10))
 
-        if not succeeded:
-            print("本批行情查询失败，将保留相关事件等待重试。")
+        if not success:
+            # Fallback to per-token lookup so one failed batch
+            # does not automatically discard all events.
+            batch_success = True
 
-    all_succeeded = success_count == (
-        (len(tokens) + 29) // 30
-    )
+            for token in batch:
+                token_ok = False
+                fallback_url = (
+                    "https://api.dexscreener.com/latest/dex/tokens/"
+                    + token
+                )
 
-    return all_pairs, all_succeeded
+                for attempt in range(2):
+                    try:
+                        response = session.get(
+                            fallback_url,
+                            timeout=REQUEST_TIMEOUT,
+                        )
 
+                        if response.status_code == 429 or response.status_code >= 500:
+                            time.sleep(min(2 ** attempt, 8))
+                            continue
 
-# ============================================================
-# 候选币筛选
-# ============================================================
+                        response.raise_for_status()
+                        data = response.json()
+
+                        if isinstance(data, dict) and "pairs" in data:
+                            pairs = data.get("pairs") or []
+                            if isinstance(pairs, list):
+                                all_pairs.extend(pairs)
+                                token_ok = True
+                        break
+
+                    except (requests.RequestException, ValueError) as exc:
+                        log(f"Fallback market lookup failed: {exc}")
+                        time.sleep(min(2 ** attempt, 8))
+
+                if not token_ok:
+                    batch_success = False
+
+            if not batch_success:
+                all_succeeded = False
+
+    # Deduplicate pairs by chain and pair address.
+    unique = {}
+    for pair in all_pairs:
+        if not isinstance(pair, dict):
+            continue
+        key = (
+            str(pair.get("chainId", "")).lower(),
+            str(pair.get("pairAddress", "")).lower(),
+        )
+        unique[key] = pair
+
+    return list(unique.values()), all_succeeded
+
 
 def evaluate_pair(pair, token_address, now_ms):
     base = pair.get("baseToken") or {}
     quote = pair.get("quoteToken") or {}
 
-    if (base.get("address") or "").lower() != token_address.lower():
+    candidate = token_address.lower()
+    base_address = str(base.get("address", "")).lower()
+    quote_address = str(quote.get("address", "")).lower()
+
+    if candidate not in (base_address, quote_address):
         return None
 
-    liquidity = float(
-        (pair.get("liquidity") or {}).get("usd") or 0
-    )
-    volume = float(
-        (pair.get("volume") or {}).get("h24") or 0
-    )
-
+    liquidity = pair.get("liquidity") or {}
+    volume = pair.get("volume") or {}
     txns = pair.get("txns") or {}
     h24 = txns.get("h24") or {}
 
-    buys = int(h24.get("buys") or 0)
-    sells = int(h24.get("sells") or 0)
-    total_txns = buys + sells
-
-    if liquidity < MIN_LIQUIDITY_USD:
+    try:
+        liquidity_usd = float(liquidity.get("usd") or 0)
+        volume_usd = float(volume.get("h24") or 0)
+        buys = int(h24.get("buys") or 0)
+        sells = int(h24.get("sells") or 0)
+        txn_count = buys + sells
+        created_at = int(pair.get("pairCreatedAt") or 0)
+    except (TypeError, ValueError):
         return None
 
-    if volume < MIN_VOLUME_24H_USD:
+    if liquidity_usd < MIN_LIQUIDITY_USD:
+        return None
+    if volume_usd < MIN_VOLUME_24H_USD:
+        return None
+    if txn_count < MIN_TXNS_24H:
         return None
 
-    if total_txns < MIN_TXNS_24H:
+    # Reject pairs with no sell activity or an unusually high
+    # volume-to-liquidity ratio.
+    if sells <= 0 or buys / sells < MIN_BUY_SELL_RATIO:
+        return None
+    if volume_usd / max(liquidity_usd, 1) > MAX_VOLUME_LIQUIDITY_RATIO:
         return None
 
-    # 防止成交量远高于池子流动性，出现异常刷量风险
-    if volume / max(liquidity, 1) > MAX_VOLUME_LIQUIDITY_RATIO:
+    if created_at <= 0:
         return None
 
-    # 买卖比：买单数 / 卖单数
-    if sells == 0:
-        buy_sell_ratio = float(buys) if buys > 0 else 0
-    else:
-        buy_sell_ratio = buys / sells
-
-    if buy_sell_ratio < MIN_BUY_SELL_RATIO:
+    age_hours = max(0, (now_ms - created_at) / 3600000)
+    if age_hours > MAX_PAIR_AGE_DAYS * 24:
         return None
 
-    pair_created = pair.get("pairCreatedAt")
-    if not pair_created:
-        return None
-
-    age_days = (now_ms - int(pair_created)) / 86400000
-
-    if age_days < 0 or age_days > MAX_PAIR_AGE_DAYS:
-        return None
-
-    price = pair.get("priceUsd") or "未知"
-    pair_url = pair.get("url") or ""
+    price_change = pair.get("priceChange") or {}
+    try:
+        change_24h = float(price_change.get("h24") or 0)
+    except (TypeError, ValueError):
+        change_24h = 0.0
 
     score = 0
-    score += min(liquidity / MIN_LIQUIDITY_USD * 15, 25)
-    score += min(volume / MIN_VOLUME_24H_USD * 10, 25)
-    score += min(total_txns / 20 * 5, 20)
-    score += min(buy_sell_ratio * 10, 20)
-    score += max(10 - age_days * 3, 0)
+    score += min(30, liquidity_usd / 300000 * 15)
+    score += min(25, volume_usd / 100000 * 10)
+    score += min(20, txn_count / 20 * 5)
+    score += 15 if buys >= sells else 5
+    score += 10 if age_hours <= 24 else 5
+    score = int(min(100, score))
 
     return {
-        "name": base.get("name") or "未知代币",
-        "symbol": base.get("symbol") or "未知",
-        "address": base.get("address") or token_address,
-        "quote": quote.get("symbol") or "",
-        "price": price,
-        "liquidity": liquidity,
-        "volume": volume,
+        "pair": pair,
+        "token": base if base_address == candidate else quote,
+        "liquidity": liquidity_usd,
+        "volume": volume_usd,
         "buys": buys,
         "sells": sells,
-        "age_days": age_days,
-        "score": round(score, 1),
-        "url": pair_url,
+        "txns": txn_count,
+        "age_hours": age_hours,
+        "change_24h": change_24h,
+        "score": score,
     }
 
 
-# ============================================================
-# 微信推送
-# ============================================================
-
 def send_wechat(title, body):
     if not SERVER_CHAN_KEY:
-        print("缺少 SERVER_CHAN_KEY，无法推送微信。")
+        log("Missing GitHub Secret: SERVER_CHAN_KEY")
         return False
 
-    url = (
-        "https://sctapi.ftqq.com/"
-        + SERVER_CHAN_KEY
-        + ".send"
-    )
+    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
 
-    try:
-        response = session.post(
-            url,
-            data={
-                "title": title[:100],
-                "desp": body,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
+    for attempt in range(3):
+        try:
+            response = session.post(
+                url,
+                data={"title": title, "desp": body},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            result = response.json()
 
-        response.raise_for_status()
-        result = response.json()
+            if result.get("code") == 0:
+                log(f"WeChat notification sent: {title}")
+                return True
 
-        if result.get("code") == 0:
-            print(f"微信推送成功：{title}")
-            return True
+            log(f"ServerChan rejected notification: {result}")
 
-        print(f"微信推送失败：{result}")
-        return False
+        except (requests.RequestException, ValueError) as exc:
+            log(f"WeChat push failed: {exc}")
 
-    except (requests.RequestException, ValueError) as exc:
-        print(f"微信推送异常：{exc}")
-        return False
+        time.sleep(min(2 ** attempt, 8))
+
+    return False
 
 
-def format_candidate(candidate, event):
-    return (
-        f"代币：{candidate['name']} ({candidate['symbol']})\n"
-        f"价格：${candidate['price']}\n"
-        f"流动性：${candidate['liquidity']:,.0f}\n"
-        f"24小时成交量：${candidate['volume']:,.0f}\n"
-        f"24小时买单/卖单："
-        f"{candidate['buys']}/{candidate['sells']}\n"
-        f"池子年龄：{candidate['age_days']:.2f} 天\n"
-        f"筛选评分：{candidate['score']}/100\n"
-        f"代币合约：{candidate['address']}\n"
-        f"池子地址：{event['pool']}\n"
-        f"交易链接：{candidate['url']}\n\n"
-        f"注意：这是筛选候选，不代表合约安全或建议直接买入。"
-    )
+def event_tokens(event):
+    return [event.get("token0"), event.get("token1")]
 
 
-# ============================================================
-# 启动检查
-# ============================================================
+def format_candidate(event, candidate):
+    pair = candidate["pair"]
+    token = candidate["token"]
 
-def self_test():
-    assert CHUNK_SIZE == 10
-    assert len(FACTORIES) == 2
-    assert POOL_TOPIC.startswith("0x")
-    assert MAX_BLOCKS_PER_RUN >= CHUNK_SIZE
-    print("基础自检通过。")
+    name = token.get("name") or "Unknown"
+    symbol = token.get("symbol") or "?"
+    token_address = token.get("address") or ""
+    pair_address = pair.get("pairAddress") or ""
+    dex = pair.get("dexId") or "Unknown DEX"
+    url = pair.get("url") or ""
 
+    title = f"Robinhood候选币：{symbol} | 评分{candidate['score']}"
 
-# ============================================================
-# 主程序
-# ============================================================
+    body = "\n".join([
+        f"代币：{name} ({symbol})",
+        f"合约：{token_address}",
+        f"交易池：{pair_address}",
+        f"DEX：{dex}",
+        f"流动性：${candidate['liquidity']:,.0f}",
+        f"24小时成交量：${candidate['volume']:,.0f}",
+        f"24小时买/卖：{candidate['buys']}/{candidate['sells']}",
+        f"池龄：{candidate['age_hours']:.1f} 小时",
+        f"24小时涨跌：{candidate['change_24h']:.2f}%",
+        f"评分：{candidate['score']}/100",
+        f"区块：{event['block']}",
+        f"交易：{event['tx']}",
+        f"行情链接：{url}",
+        "",
+        "提示：这是自动筛选候选，不代表安全或建议买入。请先核实合约、持币集中度、LP锁定及买卖税。",
+    ])
+
+    return title, body
+
 
 def main():
-    self_test()
+    log("Starting Robinhood Chain scanner")
+    log(f"Chain ID expected: {CHAIN_ID}")
 
-    if not RPC_URL:
-        print("错误：GitHub Secrets 中缺少 ALCHEMY_RPC_URL。")
-        sys.exit(1)
-
-    chain_id = int(rpc("eth_chainId", []), 16)
-
+    chain_id = int(rpc("eth_chainId"), 16)
     if chain_id != CHAIN_ID:
-        print(
-            f"错误：RPC 链 ID 为 {chain_id}，"
-            f"预期为 {CHAIN_ID}。"
+        raise RuntimeError(
+            f"Wrong chain ID: expected {CHAIN_ID}, got {chain_id}"
         )
-        sys.exit(1)
 
-    latest_block = int(rpc("eth_blockNumber", []), 16)
+    latest_block = int(rpc("eth_blockNumber"), 16)
     state = load_state()
 
-    last_block = state.get("last_block")
-
-    print(f"Robinhood Chain 最新区块：{latest_block}")
-    print(f"上次完成区块：{last_block}")
+    last_block = state["last_block"]
 
     if last_block is None:
-        start_block = max(
-            0,
-            latest_block - STARTUP_LOOKBACK_BLOCKS + 1,
+        # First run: start near the chain tip instead of scanning genesis.
+        start_block = max(0, latest_block - MAX_BLOCKS_PER_RUN)
+        log(
+            f"First run: initial scan starts at block {start_block}; "
+            f"latest block is {latest_block}"
         )
-        print(
-            f"首次启动：从最近 {STARTUP_LOOKBACK_BLOCKS} "
-            f"个区块开始扫描。"
-        )
-
     else:
-        start_block = int(last_block) + 1
-        lag = latest_block - int(last_block)
+        last_block = int(last_block)
+
+        if last_block > latest_block:
+            log("Saved block is ahead of RPC tip; resetting scan cursor near tip")
+            last_block = max(0, latest_block - MAX_BLOCKS_PER_RUN)
+
+        lag = latest_block - last_block
 
         if lag > MAX_LAG_BLOCKS:
-            start_block = max(
-                0,
-                latest_block - STARTUP_LOOKBACK_BLOCKS + 1,
-            )
-            print(
-                f"警告：历史积压 {lag:,} 个区块，"
-                f"超过 {MAX_LAG_BLOCKS:,}。"
-            )
-            print(
-                "为恢复实时监控，本轮将跳过旧积压，"
-                f"从区块 {start_block} 附近开始。"
-            )
+            new_start = max(0, latest_block - MAX_BLOCKS_PER_RUN)
+            skipped_from = last_block + 1
+            skipped_to = new_start
+
+            if skipped_to >= skipped_from:
+                skipped = {
+                    "from": skipped_from,
+                    "to": skipped_to,
+                    "recorded_at": int(time.time()),
+                    "reason": "historical backlog exceeded safety threshold",
+                }
+                state["skipped_ranges"].append(skipped)
+                log(
+                    f"BACKLOG SKIP: blocks {skipped_from}-{skipped_to}. "
+                    "Pools in this range may be missed."
+                )
+
+            last_block = new_start
+
+        start_block = last_block + 1
+
+    if start_block > latest_block:
+        log("Already at the latest block; processing pending events only")
 
     end_block = min(
         latest_block,
         start_block + MAX_BLOCKS_PER_RUN - 1,
     )
 
-    if start_block > end_block:
-        print("当前没有需要扫描的区块。")
-        return
-
-    print(f"本轮扫描范围：{start_block} - {end_block}")
-
-    events = []
+    # Persist any newly discovered events before advancing the cursor.
     cursor = start_block
-
-    # 逐段扫描；每次 eth_getLogs 最多 10 个区块
     while cursor <= end_block:
-        chunk_end = min(
-            cursor + CHUNK_SIZE - 1,
-            end_block,
-        )
+        chunk_end = min(end_block, cursor + CHUNK_SIZE - 1)
 
-        chunk_events = get_pool_events(cursor, chunk_end)
-        events.extend(chunk_events)
+        events = get_pool_events(cursor, chunk_end)
+        add_pending_events(state, events)
 
-        # 每个区块段扫描成功后才保存进度
+        # Save events and cursor together after each successful log query.
         state["last_block"] = chunk_end
         save_state(state)
 
-        print(
-            f"已扫描 {cursor} - {chunk_end}，"
-            f"发现 {len(chunk_events)} 个新池事件。"
+        log(
+            f"Scanned blocks {cursor}-{chunk_end}; "
+            f"events={len(events)}; pending={len(state['pending'])}"
         )
-
         cursor = chunk_end + 1
 
-    print(f"本轮发现池创建事件：{len(events)}")
-
-    seen = set(state.get("seen", []))
-    pending = set(state.get("pending", []))
-
-    new_events = []
-    event_by_id = {}
-
-    for event in events:
-        event_id = event["event_id"]
-
-        if event_id in seen:
-            continue
-
-        event_by_id[event_id] = event
-        new_events.append(event)
-
-    # 之前行情查询失败的事件也会再次尝试
-    for event_id in list(pending):
-        if event_id not in event_by_id and event_id not in seen:
-            # 历史事件详情不存储时，无法从 pending 恢复完整数据；
-            # 当前轮只处理仍在本轮扫描范围内的事件。
-            continue
-
-    if not new_events:
-        print("本轮没有未处理的新池事件。")
+    if not state["pending"]:
         save_state(state)
+        log(f"Scan complete. Latest block: {latest_block}; no pending events.")
+        return
+
+    # Expire very old events that still have no market listing.
+    now_seconds = int(time.time())
+    active_pending = []
+    expired_count = 0
+
+    for event in state["pending"]:
+        first_seen = int(event.get("first_seen") or now_seconds)
+        if now_seconds - first_seen > PENDING_MAX_AGE_SECONDS:
+            state["seen"].append(event.get("id", ""))
+            expired_count += 1
+        else:
+            active_pending.append(event)
+
+    state["pending"] = active_pending
+
+    if expired_count:
+        log(f"Expired {expired_count} pending events without timely market data")
+
+    if not state["pending"]:
+        save_state(state)
+        log("No pending events left to process")
         return
 
     tokens = []
+    for event in state["pending"]:
+        tokens.extend(event_tokens(event))
 
-    for event in new_events:
-        tokens.extend([event["token0"], event["token1"]])
+    pairs, api_success = fetch_market_pairs(tokens)
 
-    market_pairs, market_ok = get_market_pairs(tokens)
-
-    if not market_ok:
-        print(
-            "行情接口部分失败。本轮不把相关事件标记为完成，"
-            "避免查询失败造成漏处理。"
+    if not api_success:
+        # Keep events for another run rather than marking them seen.
+        save_state(state)
+        log(
+            "Market API was incomplete. Pending events retained for retry; "
+            "no event was discarded because of API failure."
         )
+        return
 
     now_ms = int(time.time() * 1000)
-    pushed = 0
-
-    # 建立代币地址到行情池子的映射
     pairs_by_token = {}
 
-    for pair in market_pairs:
-        base = pair.get("baseToken") or {}
-        address = (base.get("address") or "").lower()
+    for pair in pairs:
+        for token_field in ("baseToken", "quoteToken"):
+            token_info = pair.get(token_field) or {}
+            address = str(token_info.get("address") or "").lower()
+            if address:
+                pairs_by_token.setdefault(address, []).append(pair)
 
-        if address:
-            pairs_by_token.setdefault(address, []).append(pair)
+    remaining = []
+    seen_now = set(state["seen"])
+    pushed = 0
+    checked = 0
 
-    for event in new_events:
-        event_id = event["event_id"]
-
-        if event_id in seen:
+    for event in state["pending"]:
+        if pushed >= MAX_PUSHES:
+            remaining.append(event)
             continue
 
-        token_candidates = []
-        event_has_failed_lookup = False
+        event_id = event.get("id")
+        if not event_id or event_id in seen_now:
+            continue
 
-        for token in [event["token0"], event["token1"]]:
-            matching_pairs = pairs_by_token.get(token.lower(), [])
+        event_token_list = [
+            token.lower()
+            for token in event_tokens(event)
+            if token
+        ]
 
-            if not matching_pairs:
-                # 如果整批行情查询失败，不能断定这个币没有行情
-                if not market_ok:
-                    event_has_failed_lookup = True
-                continue
+        # If neither token has market data yet, retry later.
+        has_market_data = any(
+            token in pairs_by_token for token in event_token_list
+        )
 
-            for pair in matching_pairs:
+        if not has_market_data:
+            remaining.append(event)
+            continue
+
+        checked += 1
+        candidates = []
+
+        for token in event_token_list:
+            for pair in pairs_by_token.get(token, []):
                 candidate = evaluate_pair(pair, token, now_ms)
-
                 if candidate:
-                    token_candidates.append(candidate)
+                    candidates.append(candidate)
 
-        if event_has_failed_lookup:
-            pending.add(event_id)
-            continue
-
-        if token_candidates and pushed < MAX_PUSHES:
-            best = max(
-                token_candidates,
-                key=lambda item: item["score"],
+        if candidates:
+            candidates.sort(
+                key=lambda item: (item["score"], item["liquidity"]),
+                reverse=True,
             )
-
-            title = (
-                f"Robinhood候选币："
-                f"{best['symbol']}｜评分{best['score']}"
-            )
-
-            body = format_candidate(best, event)
+            best = candidates[0]
+            title, body = format_candidate(event, best)
 
             if send_wechat(title, body):
                 pushed += 1
-                seen.add(event_id)
-                pending.discard(event_id)
+                seen_now.add(event_id)
+                state["seen"].append(event_id)
             else:
-                # 推送失败时保留待处理状态，下次重试
-                pending.add(event_id)
-
-        elif token_candidates and pushed >= MAX_PUSHES:
-            # 达到推送上限的事件不标记完成，避免永久漏掉
-            pending.add(event_id)
-
+                # Failed push: retain the complete event for the next run.
+                remaining.append(event)
         else:
-            # 行情查询成功，但没有符合筛选条件的池子
-            seen.add(event_id)
-            pending.discard(event_id)
+            # Market data exists, but the event does not pass filters.
+            seen_now.add(event_id)
+            state["seen"].append(event_id)
 
-    state["seen"] = list(seen)[-20000:]
-    state["pending"] = list(pending)[-10000:]
+    state["pending"] = remaining
     save_state(state)
 
-    print(f"本轮成功推送：{pushed}")
-    print(f"已记录事件数：{len(state['seen'])}")
-    print(f"待重试事件数：{len(state['pending'])}")
-    print(f"本轮完成区块：{state['last_block']}")
+    log(
+        f"Run complete | latest={latest_block} | "
+        f"last_scanned={state['last_block']} | "
+        f"checked={checked} | pushed={pushed} | "
+        f"pending={len(state['pending'])}"
+    )
 
-    if end_block < latest_block:
-        print(
-            f"仍有 {latest_block - end_block:,} 个区块"
-            "尚未扫描，将在后续运行继续处理。"
+    if state["last_block"] < latest_block:
+        log(
+            f"More blocks remain. Next run will continue after "
+            f"{state['last_block']}."
         )
-
-    print("扫描结束。")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"本轮扫描异常：{exc}")
+        log(f"FATAL: {exc}")
         sys.exit(1)
