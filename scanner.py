@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -20,19 +19,29 @@ CHAIN_ID = 4663
 STATE_FILE = Path("state.json")
 
 FACTORIES = [
-    "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
-    "0x221A6239E40709792b0d4bdc140fA36158CD41C7",
+    Web3.to_checksum_address(
+        "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
+    ),
+    Web3.to_checksum_address(
+        "0x221A6239E40709792b0d4bdc140fA36158CD41C7"
+    ),
 ]
 
 # V3 PoolCreated(address,address,uint24,int24,address)
-POOL_CREATED_TOPIC = Web3.keccak(
+_topic_hash = Web3.keccak(
     text="PoolCreated(address,address,uint24,int24,address)"
 ).hex()
+
+POOL_CREATED_TOPIC = (
+    _topic_hash
+    if _topic_hash.startswith("0x")
+    else "0x" + _topic_hash
+)
 
 # Scan limits
 CHUNK_SIZE = 10
 MAX_BLOCKS_PER_RUN = 300
-MAX_LAG_BLOCKS = 50000
+MAX_LAG_BLOCKS = 200000
 MAX_PUSHES = 8
 MAX_PENDING_EVENTS = 3000
 MAX_SEEN_EVENTS = 10000
@@ -58,7 +67,10 @@ last_rpc_request = 0.0
 
 
 def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}",
+        flush=True,
+    )
 
 
 def rpc(method, params=None):
@@ -77,7 +89,10 @@ def rpc(method, params=None):
     }
 
     for attempt in range(MAX_RETRIES):
-        wait = RPC_MIN_INTERVAL - (time.monotonic() - last_rpc_request)
+        wait = RPC_MIN_INTERVAL - (
+            time.monotonic() - last_rpc_request
+        )
+
         if wait > 0:
             time.sleep(wait)
 
@@ -87,11 +102,18 @@ def rpc(method, params=None):
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
+
             last_rpc_request = time.monotonic()
 
-            if response.status_code == 429 or response.status_code >= 500:
+            if (
+                response.status_code == 429
+                or response.status_code >= 500
+            ):
                 delay = min(2 ** attempt, 20)
-                log(f"RPC HTTP {response.status_code}; retry in {delay}s")
+                log(
+                    f"RPC HTTP {response.status_code}; "
+                    f"retry in {delay}s"
+                )
                 time.sleep(delay)
                 continue
 
@@ -103,28 +125,47 @@ def rpc(method, params=None):
                 message = str(error.get("message", error))
                 code = error.get("code")
 
-                if code == -32005 or "rate limit" in message.lower():
+                if (
+                    code == -32005
+                    or "rate limit" in message.lower()
+                ):
                     delay = min(2 ** attempt, 20)
-                    log(f"RPC rate limit; retry in {delay}s")
+                    log(
+                        f"RPC rate limit; retry in {delay}s"
+                    )
                     time.sleep(delay)
                     continue
 
-                raise RuntimeError(f"RPC {method} error: {error}")
+                raise RuntimeError(
+                    f"RPC {method} error: {error}"
+                )
 
             if "result" not in body:
-                raise RuntimeError(f"RPC {method}: missing result")
+                raise RuntimeError(
+                    f"RPC {method}: missing result"
+                )
 
             return body["result"]
 
-        except (requests.RequestException, ValueError) as exc:
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as exc:
             if attempt == MAX_RETRIES - 1:
-                raise RuntimeError(f"RPC {method} failed: {exc}") from exc
+                raise RuntimeError(
+                    f"RPC {method} failed: {exc}"
+                ) from exc
 
             delay = min(2 ** attempt, 20)
-            log(f"RPC request failed: {exc}; retry in {delay}s")
+            log(
+                f"RPC request failed: {exc}; "
+                f"retry in {delay}s"
+            )
             time.sleep(delay)
 
-    raise RuntimeError(f"RPC {method} exhausted retries")
+    raise RuntimeError(
+        f"RPC {method} exhausted retries"
+    )
 
 
 def load_state():
@@ -137,9 +178,14 @@ def load_state():
         }
 
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+
         if not isinstance(data, dict):
-            raise ValueError("state root is not an object")
+            raise ValueError(
+                "state root is not an object"
+            )
 
         data.setdefault("last_block", None)
         data.setdefault("seen", [])
@@ -148,15 +194,16 @@ def load_state():
 
         if not isinstance(data["seen"], list):
             data["seen"] = []
+
         if not isinstance(data["pending"], list):
             data["pending"] = []
+
         if not isinstance(data["skipped_ranges"], list):
             data["skipped_ranges"] = []
 
         return data
 
     except Exception as exc:
-        # Do not silently overwrite a corrupt state file.
         raise RuntimeError(
             f"Cannot read {STATE_FILE}: {exc}. "
             "Stop to protect the existing scan state."
@@ -164,29 +211,49 @@ def load_state():
 
 
 def save_state(state):
-    state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN_EVENTS:]
-    state["pending"] = state["pending"][-MAX_PENDING_EVENTS:]
-    state["skipped_ranges"] = state["skipped_ranges"][-100:]
+    state["seen"] = list(
+        dict.fromkeys(state["seen"])
+    )[-MAX_SEEN_EVENTS:]
+
+    state["pending"] = state["pending"][
+        -MAX_PENDING_EVENTS:
+    ]
+
+    state["skipped_ranges"] = state[
+        "skipped_ranges"
+    ][-100:]
 
     temp_file = STATE_FILE.with_suffix(".tmp")
+
     temp_file.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
+
     temp_file.replace(STATE_FILE)
 
 
 def address_from_topic(topic):
     if not topic or len(topic) < 42:
         return None
+
     try:
-        return Web3.to_checksum_address("0x" + topic[-40:])
+        return Web3.to_checksum_address(
+            "0x" + topic[-40:]
+        )
     except Exception:
         return None
 
 
 def address_from_data(data, word_index):
-    if not isinstance(data, str) or not data.startswith("0x"):
+    if (
+        not isinstance(data, str)
+        or not data.startswith("0x")
+    ):
         return None
 
     raw = data[2:]
@@ -197,7 +264,9 @@ def address_from_data(data, word_index):
         return None
 
     try:
-        return Web3.to_checksum_address("0x" + word[-40:])
+        return Web3.to_checksum_address(
+            "0x" + word[-40:]
+        )
     except Exception:
         return None
 
@@ -207,13 +276,50 @@ def get_pool_events(start_block, end_block):
         return []
 
     if end_block - start_block + 1 > CHUNK_SIZE:
-        raise ValueError("eth_getLogs chunk exceeds CHUNK_SIZE")
+        raise ValueError(
+            "eth_getLogs chunk exceeds CHUNK_SIZE"
+        )
+
+    # JSON-RPC quantity values must include 0x.
+    from_block_hex = hex(int(start_block))
+    to_block_hex = hex(int(end_block))
+
+    if (
+        not from_block_hex.startswith("0x")
+        or not to_block_hex.startswith("0x")
+    ):
+        raise ValueError(
+            "eth_getLogs block quantity "
+            "is missing 0x prefix"
+        )
+
+    if not POOL_CREATED_TOPIC.startswith("0x"):
+        raise ValueError(
+            "PoolCreated topic is missing 0x prefix"
+        )
+
+    if any(
+        not address.startswith("0x")
+        for address in FACTORIES
+    ):
+        raise ValueError(
+            "A factory address is missing 0x prefix"
+        )
+
+    # Log the exact filter fields, without exposing RPC secrets.
+    log(
+        "eth_getLogs filter: "
+        f"fromBlock={from_block_hex}, "
+        f"toBlock={to_block_hex}, "
+        f"factory_count={len(FACTORIES)}, "
+        f"topic={POOL_CREATED_TOPIC}"
+    )
 
     result = rpc(
         "eth_getLogs",
         [{
-            "fromBlock": hex(start_block),
-            "toBlock": hex(end_block),
+            "fromBlock": from_block_hex,
+            "toBlock": to_block_hex,
             "address": FACTORIES,
             "topics": [POOL_CREATED_TOPIC],
         }],
@@ -223,28 +329,53 @@ def get_pool_events(start_block, end_block):
 
     for item in result:
         topics = item.get("topics", [])
+
         if len(topics) < 3:
             continue
 
         token0 = address_from_topic(topics[1])
         token1 = address_from_topic(topics[2])
 
-        # V3 PoolCreated data words:
-        # word 0 = tickSpacing, word 1 = pool address
-        pool_address = address_from_data(item.get("data", ""), 1)
+        # V3 PoolCreated data:
+        # word 0 = tickSpacing
+        # word 1 = pool address
+        pool_address = address_from_data(
+            item.get("data", ""),
+            1,
+        )
 
-        if not token0 or not token1 or not pool_address:
-            log("Warning: ignored malformed PoolCreated event")
+        if (
+            not token0
+            or not token1
+            or not pool_address
+        ):
+            log(
+                "Warning: ignored malformed "
+                "PoolCreated event"
+            )
             continue
 
-        tx_hash = item.get("transactionHash", "")
-        log_index = int(item.get("logIndex", "0x0"), 16)
-        block_number = int(item.get("blockNumber", "0x0"), 16)
+        tx_hash = item.get(
+            "transactionHash",
+            "",
+        )
+
+        log_index = int(
+            item.get("logIndex", "0x0"),
+            16,
+        )
+
+        block_number = int(
+            item.get("blockNumber", "0x0"),
+            16,
+        )
 
         if not tx_hash:
             continue
 
-        event_id = f"{tx_hash.lower()}:{log_index}"
+        event_id = (
+            f"{tx_hash.lower()}:{log_index}"
+        )
 
         events.append({
             "id": event_id,
@@ -266,11 +397,16 @@ def add_pending_events(state, events):
         for item in state["pending"]
         if isinstance(item, dict)
     }
+
     seen = set(state["seen"])
 
     for event in events:
         event_id = event["id"]
-        if event_id in existing or event_id in seen:
+
+        if (
+            event_id in existing
+            or event_id in seen
+        ):
             continue
 
         state["pending"].append(event)
@@ -278,17 +414,25 @@ def add_pending_events(state, events):
 
     if len(state["pending"]) > MAX_PENDING_EVENTS:
         log(
-            "ERROR: pending queue exceeded its safety limit. "
-            "Some newest events cannot be retained."
+            "ERROR: pending queue exceeded its "
+            "safety limit. Some newest events "
+            "cannot be retained."
         )
-        state["pending"] = state["pending"][-MAX_PENDING_EVENTS:]
+
+        state["pending"] = state["pending"][
+            -MAX_PENDING_EVENTS:
+        ]
 
 
 def fetch_market_pairs(tokens):
     """Return (pairs, success). False means data retrieval was incomplete."""
-    tokens = list(dict.fromkeys(
-        token.lower() for token in tokens if token
-    ))
+    tokens = list(
+        dict.fromkeys(
+            token.lower()
+            for token in tokens
+            if token
+        )
+    )
 
     if not tokens:
         return [], True
@@ -296,9 +440,10 @@ def fetch_market_pairs(tokens):
     all_pairs = []
     all_succeeded = True
 
-    # DexScreener tokens endpoint supports batches of token addresses.
+    # Try the batch endpoint first.
     for offset in range(0, len(tokens), 30):
         batch = tokens[offset:offset + 30]
+
         url = (
             "https://api.dexscreener.com/tokens/v1/robinhood/"
             + ",".join(batch)
@@ -308,10 +453,18 @@ def fetch_market_pairs(tokens):
 
         for attempt in range(3):
             try:
-                response = session.get(url, timeout=REQUEST_TIMEOUT)
+                response = session.get(
+                    url,
+                    timeout=REQUEST_TIMEOUT,
+                )
 
-                if response.status_code == 429 or response.status_code >= 500:
-                    time.sleep(min(2 ** attempt, 10))
+                if (
+                    response.status_code == 429
+                    or response.status_code >= 500
+                ):
+                    time.sleep(
+                        min(2 ** attempt, 10)
+                    )
                     continue
 
                 response.raise_for_status()
@@ -322,22 +475,33 @@ def fetch_market_pairs(tokens):
                     success = True
                     break
 
-                log("Market API returned an unexpected response format")
+                log(
+                    "Market API returned an "
+                    "unexpected response format"
+                )
                 break
 
-            except (requests.RequestException, ValueError) as exc:
-                log(f"Market API batch request failed: {exc}")
-                time.sleep(min(2 ** attempt, 10))
+            except (
+                requests.RequestException,
+                ValueError,
+            ) as exc:
+                log(
+                    f"Market API batch request failed: {exc}"
+                )
+                time.sleep(
+                    min(2 ** attempt, 10)
+                )
 
         if not success:
-            # Fallback to per-token lookup so one failed batch
-            # does not automatically discard all events.
+            # Fallback to individual token lookups.
             batch_success = True
 
             for token in batch:
                 token_ok = False
+
                 fallback_url = (
-                    "https://api.dexscreener.com/latest/dex/tokens/"
+                    "https://api.dexscreener.com/"
+                    "latest/dex/tokens/"
                     + token
                 )
 
@@ -348,23 +512,41 @@ def fetch_market_pairs(tokens):
                             timeout=REQUEST_TIMEOUT,
                         )
 
-                        if response.status_code == 429 or response.status_code >= 500:
-                            time.sleep(min(2 ** attempt, 8))
+                        if (
+                            response.status_code == 429
+                            or response.status_code >= 500
+                        ):
+                            time.sleep(
+                                min(2 ** attempt, 8)
+                            )
                             continue
 
                         response.raise_for_status()
                         data = response.json()
 
-                        if isinstance(data, dict) and "pairs" in data:
+                        if (
+                            isinstance(data, dict)
+                            and "pairs" in data
+                        ):
                             pairs = data.get("pairs") or []
+
                             if isinstance(pairs, list):
                                 all_pairs.extend(pairs)
                                 token_ok = True
+
                         break
 
-                    except (requests.RequestException, ValueError) as exc:
-                        log(f"Fallback market lookup failed: {exc}")
-                        time.sleep(min(2 ** attempt, 8))
+                    except (
+                        requests.RequestException,
+                        ValueError,
+                    ) as exc:
+                        log(
+                            "Fallback market lookup "
+                            f"failed: {exc}"
+                        )
+                        time.sleep(
+                            min(2 ** attempt, 8)
+                        )
 
                 if not token_ok:
                     batch_success = False
@@ -372,15 +554,20 @@ def fetch_market_pairs(tokens):
             if not batch_success:
                 all_succeeded = False
 
-    # Deduplicate pairs by chain and pair address.
+    # Deduplicate by chain and pair address.
     unique = {}
+
     for pair in all_pairs:
         if not isinstance(pair, dict):
             continue
+
         key = (
             str(pair.get("chainId", "")).lower(),
-            str(pair.get("pairAddress", "")).lower(),
+            str(
+                pair.get("pairAddress", "")
+            ).lower(),
         )
+
         unique[key] = pair
 
     return list(unique.values()), all_succeeded
@@ -391,10 +578,19 @@ def evaluate_pair(pair, token_address, now_ms):
     quote = pair.get("quoteToken") or {}
 
     candidate = token_address.lower()
-    base_address = str(base.get("address", "")).lower()
-    quote_address = str(quote.get("address", "")).lower()
 
-    if candidate not in (base_address, quote_address):
+    base_address = str(
+        base.get("address", "")
+    ).lower()
+
+    quote_address = str(
+        quote.get("address", "")
+    ).lower()
+
+    if candidate not in (
+        base_address,
+        quote_address,
+    ):
         return None
 
     liquidity = pair.get("liquidity") or {}
@@ -403,53 +599,93 @@ def evaluate_pair(pair, token_address, now_ms):
     h24 = txns.get("h24") or {}
 
     try:
-        liquidity_usd = float(liquidity.get("usd") or 0)
-        volume_usd = float(volume.get("h24") or 0)
+        liquidity_usd = float(
+            liquidity.get("usd") or 0
+        )
+
+        volume_usd = float(
+            volume.get("h24") or 0
+        )
+
         buys = int(h24.get("buys") or 0)
         sells = int(h24.get("sells") or 0)
+
         txn_count = buys + sells
-        created_at = int(pair.get("pairCreatedAt") or 0)
+
+        created_at = int(
+            pair.get("pairCreatedAt") or 0
+        )
+
     except (TypeError, ValueError):
         return None
 
     if liquidity_usd < MIN_LIQUIDITY_USD:
         return None
+
     if volume_usd < MIN_VOLUME_24H_USD:
         return None
+
     if txn_count < MIN_TXNS_24H:
         return None
 
-    # Reject pairs with no sell activity or an unusually high
-    # volume-to-liquidity ratio.
-    if sells <= 0 or buys / sells < MIN_BUY_SELL_RATIO:
+    # Reject pairs with no sell activity or
+    # an unusually high volume/liquidity ratio.
+    if sells <= 0:
         return None
-    if volume_usd / max(liquidity_usd, 1) > MAX_VOLUME_LIQUIDITY_RATIO:
+
+    if buys / sells < MIN_BUY_SELL_RATIO:
+        return None
+
+    if (
+        volume_usd / max(liquidity_usd, 1)
+        > MAX_VOLUME_LIQUIDITY_RATIO
+    ):
         return None
 
     if created_at <= 0:
         return None
 
-    age_hours = max(0, (now_ms - created_at) / 3600000)
+    age_hours = max(
+        0,
+        (now_ms - created_at) / 3600000,
+    )
+
     if age_hours > MAX_PAIR_AGE_DAYS * 24:
         return None
 
     price_change = pair.get("priceChange") or {}
+
     try:
-        change_24h = float(price_change.get("h24") or 0)
+        change_24h = float(
+            price_change.get("h24") or 0
+        )
     except (TypeError, ValueError):
         change_24h = 0.0
 
     score = 0
-    score += min(30, liquidity_usd / 300000 * 15)
-    score += min(25, volume_usd / 100000 * 10)
-    score += min(20, txn_count / 20 * 5)
+    score += min(
+        30,
+        liquidity_usd / 300000 * 15,
+    )
+    score += min(
+        25,
+        volume_usd / 100000 * 10,
+    )
+    score += min(
+        20,
+        txn_count / 20 * 5,
+    )
     score += 15 if buys >= sells else 5
     score += 10 if age_hours <= 24 else 5
     score = int(min(100, score))
 
     return {
         "pair": pair,
-        "token": base if base_address == candidate else quote,
+        "token": (
+            base
+            if base_address == candidate
+            else quote
+        ),
         "liquidity": liquidity_usd,
         "volume": volume_usd,
         "buys": buys,
@@ -463,37 +699,59 @@ def evaluate_pair(pair, token_address, now_ms):
 
 def send_wechat(title, body):
     if not SERVER_CHAN_KEY:
-        log("Missing GitHub Secret: SERVER_CHAN_KEY")
+        log(
+            "Missing GitHub Secret: SERVER_CHAN_KEY"
+        )
         return False
 
-    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+    url = (
+        f"https://sctapi.ftqq.com/"
+        f"{SERVER_CHAN_KEY}.send"
+    )
 
     for attempt in range(3):
         try:
             response = session.post(
                 url,
-                data={"title": title, "desp": body},
+                data={
+                    "title": title,
+                    "desp": body,
+                },
                 timeout=REQUEST_TIMEOUT,
             )
+
             response.raise_for_status()
             result = response.json()
 
             if result.get("code") == 0:
-                log(f"WeChat notification sent: {title}")
+                log(
+                    f"WeChat notification sent: {title}"
+                )
                 return True
 
-            log(f"ServerChan rejected notification: {result}")
+            log(
+                "ServerChan rejected notification: "
+                f"{result}"
+            )
 
-        except (requests.RequestException, ValueError) as exc:
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as exc:
             log(f"WeChat push failed: {exc}")
 
-        time.sleep(min(2 ** attempt, 8))
+        time.sleep(
+            min(2 ** attempt, 8)
+        )
 
     return False
 
 
 def event_tokens(event):
-    return [event.get("token0"), event.get("token1")]
+    return [
+        event.get("token0"),
+        event.get("token1"),
+    ]
 
 
 def format_candidate(event, candidate):
@@ -502,12 +760,16 @@ def format_candidate(event, candidate):
 
     name = token.get("name") or "Unknown"
     symbol = token.get("symbol") or "?"
+
     token_address = token.get("address") or ""
     pair_address = pair.get("pairAddress") or ""
     dex = pair.get("dexId") or "Unknown DEX"
     url = pair.get("url") or ""
 
-    title = f"Robinhood候选币：{symbol} | 评分{candidate['score']}"
+    title = (
+        f"Robinhood候选币：{symbol} | "
+        f"评分{candidate['score']}"
+    )
 
     body = "\n".join([
         f"代币：{name} ({symbol})",
@@ -516,15 +778,25 @@ def format_candidate(event, candidate):
         f"DEX：{dex}",
         f"流动性：${candidate['liquidity']:,.0f}",
         f"24小时成交量：${candidate['volume']:,.0f}",
-        f"24小时买/卖：{candidate['buys']}/{candidate['sells']}",
+        (
+            f"24小时买/卖："
+            f"{candidate['buys']}/"
+            f"{candidate['sells']}"
+        ),
         f"池龄：{candidate['age_hours']:.1f} 小时",
-        f"24小时涨跌：{candidate['change_24h']:.2f}%",
+        (
+            f"24小时涨跌："
+            f"{candidate['change_24h']:.2f}%"
+        ),
         f"评分：{candidate['score']}/100",
         f"区块：{event['block']}",
         f"交易：{event['tx']}",
         f"行情链接：{url}",
         "",
-        "提示：这是自动筛选候选，不代表安全或建议买入。请先核实合约、持币集中度、LP锁定及买卖税。",
+        (
+            "提示：这是自动筛选候选，不代表安全或建议买入。"
+            "请先核实合约、持币集中度、LP锁定及买卖税。"
+        ),
     ])
 
     return title, body
@@ -534,35 +806,59 @@ def main():
     log("Starting Robinhood Chain scanner")
     log(f"Chain ID expected: {CHAIN_ID}")
 
-    chain_id = int(rpc("eth_chainId"), 16)
+    chain_id = int(
+        rpc("eth_chainId"),
+        16,
+    )
+
     if chain_id != CHAIN_ID:
         raise RuntimeError(
-            f"Wrong chain ID: expected {CHAIN_ID}, got {chain_id}"
+            f"Wrong chain ID: expected {CHAIN_ID}, "
+            f"got {chain_id}"
         )
 
-    latest_block = int(rpc("eth_blockNumber"), 16)
-    state = load_state()
+    latest_block = int(
+        rpc("eth_blockNumber"),
+        16,
+    )
 
+    state = load_state()
     last_block = state["last_block"]
 
     if last_block is None:
-        # First run: start near the chain tip instead of scanning genesis.
-        start_block = max(0, latest_block - MAX_BLOCKS_PER_RUN)
-        log(
-            f"First run: initial scan starts at block {start_block}; "
-            f"latest block is {latest_block}"
+        # First run starts near the chain tip.
+        start_block = max(
+            0,
+            latest_block - MAX_BLOCKS_PER_RUN,
         )
+
+        log(
+            f"First run: initial scan starts at block "
+            f"{start_block}; latest block is {latest_block}"
+        )
+
     else:
         last_block = int(last_block)
 
         if last_block > latest_block:
-            log("Saved block is ahead of RPC tip; resetting scan cursor near tip")
-            last_block = max(0, latest_block - MAX_BLOCKS_PER_RUN)
+            log(
+                "Saved block is ahead of RPC tip; "
+                "resetting scan cursor near tip"
+            )
+
+            last_block = max(
+                0,
+                latest_block - MAX_BLOCKS_PER_RUN,
+            )
 
         lag = latest_block - last_block
 
         if lag > MAX_LAG_BLOCKS:
-            new_start = max(0, latest_block - MAX_BLOCKS_PER_RUN)
+            new_start = max(
+                0,
+                latest_block - MAX_BLOCKS_PER_RUN,
+            )
+
             skipped_from = last_block + 1
             skipped_to = new_start
 
@@ -571,11 +867,17 @@ def main():
                     "from": skipped_from,
                     "to": skipped_to,
                     "recorded_at": int(time.time()),
-                    "reason": "historical backlog exceeded safety threshold",
+                    "reason": (
+                        "historical backlog exceeded "
+                        "safety threshold"
+                    ),
                 }
+
                 state["skipped_ranges"].append(skipped)
+
                 log(
-                    f"BACKLOG SKIP: blocks {skipped_from}-{skipped_to}. "
+                    f"BACKLOG SKIP: blocks "
+                    f"{skipped_from}-{skipped_to}. "
                     "Pools in this range may be missed."
                 )
 
@@ -584,45 +886,72 @@ def main():
         start_block = last_block + 1
 
     if start_block > latest_block:
-        log("Already at the latest block; processing pending events only")
+        log(
+            "Already at the latest block; "
+            "processing pending events only"
+        )
 
     end_block = min(
         latest_block,
         start_block + MAX_BLOCKS_PER_RUN - 1,
     )
 
-    # Persist any newly discovered events before advancing the cursor.
+    # Persist events and cursor after each successful query.
     cursor = start_block
+
     while cursor <= end_block:
-        chunk_end = min(end_block, cursor + CHUNK_SIZE - 1)
+        chunk_end = min(
+            end_block,
+            cursor + CHUNK_SIZE - 1,
+        )
 
-        events = get_pool_events(cursor, chunk_end)
-        add_pending_events(state, events)
+        events = get_pool_events(
+            cursor,
+            chunk_end,
+        )
 
-        # Save events and cursor together after each successful log query.
+        add_pending_events(
+            state,
+            events,
+        )
+
         state["last_block"] = chunk_end
         save_state(state)
 
         log(
             f"Scanned blocks {cursor}-{chunk_end}; "
-            f"events={len(events)}; pending={len(state['pending'])}"
+            f"events={len(events)}; "
+            f"pending={len(state['pending'])}"
         )
+
         cursor = chunk_end + 1
 
     if not state["pending"]:
         save_state(state)
-        log(f"Scan complete. Latest block: {latest_block}; no pending events.")
+
+        log(
+            f"Scan complete. Latest block: "
+            f"{latest_block}; no pending events."
+        )
         return
 
-    # Expire very old events that still have no market listing.
+    # Expire events that have no market listing after 24 hours.
     now_seconds = int(time.time())
     active_pending = []
     expired_count = 0
 
     for event in state["pending"]:
-        first_seen = int(event.get("first_seen") or now_seconds)
-        if now_seconds - first_seen > PENDING_MAX_AGE_SECONDS:
-            state["seen"].append(event.get("id", ""))
+        first_seen = int(
+            event.get("first_seen") or now_seconds
+        )
+
+        if (
+            now_seconds - first_seen
+            > PENDING_MAX_AGE_SECONDS
+        ):
+            state["seen"].append(
+                event.get("id", "")
+            )
             expired_count += 1
         else:
             active_pending.append(event)
@@ -630,7 +959,10 @@ def main():
     state["pending"] = active_pending
 
     if expired_count:
-        log(f"Expired {expired_count} pending events without timely market data")
+        log(
+            f"Expired {expired_count} pending events "
+            "without timely market data"
+        )
 
     if not state["pending"]:
         save_state(state)
@@ -638,17 +970,22 @@ def main():
         return
 
     tokens = []
+
     for event in state["pending"]:
-        tokens.extend(event_tokens(event))
+        tokens.extend(
+            event_tokens(event)
+        )
 
     pairs, api_success = fetch_market_pairs(tokens)
 
     if not api_success:
-        # Keep events for another run rather than marking them seen.
+        # Keep events for another run.
         save_state(state)
+
         log(
-            "Market API was incomplete. Pending events retained for retry; "
-            "no event was discarded because of API failure."
+            "Market API was incomplete. Pending events "
+            "retained for retry; no event was discarded "
+            "because of API failure."
         )
         return
 
@@ -656,11 +993,21 @@ def main():
     pairs_by_token = {}
 
     for pair in pairs:
-        for token_field in ("baseToken", "quoteToken"):
+        for token_field in (
+            "baseToken",
+            "quoteToken",
+        ):
             token_info = pair.get(token_field) or {}
-            address = str(token_info.get("address") or "").lower()
+
+            address = str(
+                token_info.get("address") or ""
+            ).lower()
+
             if address:
-                pairs_by_token.setdefault(address, []).append(pair)
+                pairs_by_token.setdefault(
+                    address,
+                    [],
+                ).append(pair)
 
     remaining = []
     seen_now = set(state["seen"])
@@ -673,6 +1020,7 @@ def main():
             continue
 
         event_id = event.get("id")
+
         if not event_id or event_id in seen_now:
             continue
 
@@ -682,9 +1030,10 @@ def main():
             if token
         ]
 
-        # If neither token has market data yet, retry later.
+        # Retry later if neither token has market data.
         has_market_data = any(
-            token in pairs_by_token for token in event_token_list
+            token in pairs_by_token
+            for token in event_token_list
         )
 
         if not has_market_data:
@@ -696,27 +1045,42 @@ def main():
 
         for token in event_token_list:
             for pair in pairs_by_token.get(token, []):
-                candidate = evaluate_pair(pair, token, now_ms)
+                candidate = evaluate_pair(
+                    pair,
+                    token,
+                    now_ms,
+                )
+
                 if candidate:
                     candidates.append(candidate)
 
         if candidates:
             candidates.sort(
-                key=lambda item: (item["score"], item["liquidity"]),
+                key=lambda item: (
+                    item["score"],
+                    item["liquidity"],
+                ),
                 reverse=True,
             )
+
             best = candidates[0]
-            title, body = format_candidate(event, best)
+
+            title, body = format_candidate(
+                event,
+                best,
+            )
 
             if send_wechat(title, body):
                 pushed += 1
                 seen_now.add(event_id)
                 state["seen"].append(event_id)
+
             else:
-                # Failed push: retain the complete event for the next run.
+                # Failed push: retry next run.
                 remaining.append(event)
+
         else:
-            # Market data exists, but the event does not pass filters.
+            # Market data exists, but filters were not passed.
             seen_now.add(event_id)
             state["seen"].append(event_id)
 
@@ -732,8 +1096,8 @@ def main():
 
     if state["last_block"] < latest_block:
         log(
-            f"More blocks remain. Next run will continue after "
-            f"{state['last_block']}."
+            f"More blocks remain. Next run will continue "
+            f"after {state['last_block']}."
         )
 
 
