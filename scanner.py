@@ -1122,4 +1122,4 @@ if __name__ == "__main__":
 
     except Exception as exc:
         log(f"FATAL: {exc}")
-        sys.exit（1）
+        sys.exit(1)
