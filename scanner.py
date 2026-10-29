@@ -1103,7 +1103,23 @@ def main():
 
 if __name__ == "__main__":
     try:
+        if os.getenv("TEST_PUSH") == "1":
+            log("Starting WeChat push test")
+
+            if send_wechat(
+                "Robinhood 扫链机器人测试",
+                "微信推送测试成功！\n\n"
+                "说明：Server酱通知接口已成功发送测试消息。\n"
+                "本消息不是买币信号，没有执行任何交易。"
+            ):
+                log("TEST PUSH SUCCESS")
+                sys.exit(0)
+            else:
+                log("TEST PUSH FAILED")
+                sys.exit(1)
+
         main()
+
     except Exception as exc:
         log(f"FATAL: {exc}")
-        sys.exit(1)
+        sys.exit(1
