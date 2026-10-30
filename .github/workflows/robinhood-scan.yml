@@ -4,10 +4,14 @@ name: Robinhood Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
+
+concurrency:
+  group: robinhood-scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -15,41 +19,32 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.11'
 
       - name: Restore scanner state
         uses: actions/cache/restore@v4
         with:
-          path: |
-            state.json
-            scanned_data.json
-          key: scanner-state-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            scanner-state-${{ runner.os }}-
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: scanner-state-
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install web3 requests
+        run: pip install 'web3>=7,<8' requests
 
       - name: Run Scanner
         env:
           ALCHEMY_RPC_URL: ${{ secrets.ALCHEMY_RPC_URL }}
           SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
-          TEST_PUSH: "0"
+          TEST_PUSH: '0'
         run: python scanner.py
 
       - name: Save scanner state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: |
-            state.json
-            scanned_data.json
-          key: scanner-state-${{ runner.os }}-${{ github.run_id }}
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
