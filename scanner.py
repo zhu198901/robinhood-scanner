@@ -1,113 +1,249 @@
 
 import os
+import sys
 import json
 import time
 import requests
+
 from pathlib import Path
 from datetime import datetime, timezone
 from web3 import Web3
 
-RPC_URL = os.getenv("ALCHEMY_RPC_URL", "").strip()
-SEND_KEY = os.getenv("SERVER_CHAN_KEY", "").strip()
-TEST_PUSH = os.getenv("TEST_PUSH", "0") == "1"
 
-STATE = Path("state.json")
+# Robinhood Chain Scanner
+# Read-only: never executes trades
+
+RPC_URL = os.getenv(
+    "ALCHEMY_RPC_URL", ""
+).strip()
+
+SEND_KEY = os.getenv(
+    "SERVER_CHAN_KEY", ""
+).strip()
+
+TEST_PUSH = (
+    os.getenv("TEST_PUSH", "0") == "1"
+)
+
+STATE_FILE = Path("state.json")
+
 CHAIN_ID = 4663
 
-FACTORY_V3 = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
+FACTORY_V3 = (
+    "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
+)
 
-TOPIC = Web3.keccak(
-    text="PoolCreated(address,address,uint24,int24,address)"
-).to_0x_hex()
+POOL_TOPIC = Web3.to_hex(
+    Web3.keccak(
+        text=(
+            "PoolCreated("
+            "address,address,uint24,int24,address)"
+        )
+    )
+)
 
-SESSION = requests.Session()
+CHUNK_SIZE = 10
+MAX_BLOCKS_PER_RUN = 3000
+
+MIN_LIQUIDITY = 300000
+MIN_VOLUME = 100000
+MIN_TXNS = 20
+MAX_AGE_HOURS = 72
+
+MAX_PUSHES = 8
+TIMEOUT = 25
+
+session = requests.Session()
 
 
 def log(*args):
-    timestamp = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-    print(timestamp, *args, flush=True)
+    now = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    print(now, *args, flush=True)
+
+
+def safe_text(value):
+    value = str(value)
+
+    for secret in (RPC_URL, SEND_KEY):
+        if secret:
+            value = value.replace(
+                secret, "[REDACTED]"
+            )
+
+    return value
 
 
 def rpc(method, params=None):
     if not RPC_URL:
-        raise RuntimeError("ALCHEMY_RPC_URL missing")
+        raise RuntimeError(
+            "Missing ALCHEMY_RPC_URL"
+        )
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params or [],
+    }
 
     for attempt in range(4):
         try:
-            response = SESSION.post(
+            response = session.post(
                 RPC_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params or [],
-                },
-                timeout=25,
+                json=payload,
+                timeout=TIMEOUT,
             )
-            response.raise_for_status()
+
+            if response.status_code != 200:
+                detail = safe_text(
+                    response.text[:500]
+                )
+
+                log(
+                    "RPC HTTP error",
+                    response.status_code,
+                    "method=" + method,
+                    "details=" + detail,
+                )
+
+                response.raise_for_status()
+
             data = response.json()
 
             if "error" in data:
-                raise RuntimeError(str(data["error"]))
+                raise RuntimeError(
+                    safe_text(data["error"])
+                )
+
+            if "result" not in data:
+                raise RuntimeError(
+                    "RPC missing result"
+                )
 
             return data["result"]
 
         except Exception as exc:
-            log("RPC failed", type(exc).__name__)
+            log(
+                "RPC failed:",
+                method,
+                type(exc).__name__,
+                safe_text(exc)[:300],
+            )
 
             if attempt == 3:
                 raise
 
-            time.sleep(2 ** attempt)
+            time.sleep(
+                min(2 ** attempt, 8)
+            )
 
 
 def push(title, message):
     if not SEND_KEY:
-        log("SERVER_CHAN_KEY missing")
+        log("Missing SERVER_CHAN_KEY")
         return False
 
-    try:
-        response = SESSION.post(
-            "https://sctapi.ftqq.com/" + SEND_KEY + ".send",
-            data={
-                "title": title,
-                "desp": message,
-            },
-            timeout=25,
+    url = (
+        "https://sctapi.ftqq.com/"
+        + SEND_KEY
+        + ".send"
+    )
+
+    for attempt in range(3):
+        try:
+            response = session.post(
+                url,
+                data={
+                    "title": title,
+                    "desp": message,
+                },
+                timeout=TIMEOUT,
+            )
+
+            if response.status_code != 200:
+                log(
+                    "ServerChan HTTP",
+                    response.status_code,
+                    safe_text(
+                        response.text[:300]
+                    ),
+                )
+
+                if response.status_code in (
+                    400, 401, 403
+                ):
+                    return False
+
+                time.sleep(2 ** attempt)
+                continue
+
+            data = response.json()
+
+            if data.get("code") == 0:
+                log("WeChat push success")
+                return True
+
+            log(
+                "ServerChan error:",
+                safe_text(data)[:300],
+            )
+
+            return False
+
+        except Exception as exc:
+            log(
+                "WeChat error:",
+                type(exc).__name__,
+            )
+
+            time.sleep(2 ** attempt)
+
+    return False
+
+
+def load_state():
+    default = {
+        "last_block": None,
+        "pending": [],
+        "seen": [],
+        "last_report_day": None,
+    }
+
+    if not STATE_FILE.exists():
+        return default
+
+    data = json.loads(
+        STATE_FILE.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Invalid state.json"
         )
 
-        data = response.json()
-        success = response.ok and data.get("code") == 0
+    for key, value in default.items():
+        data.setdefault(key, value)
 
-        log(
-            "WeChat push:",
-            "success" if success else
-            "failed, code=" + str(data.get("code")),
-        )
+    if not isinstance(
+        data["pending"], list
+    ):
+        data["pending"] = []
 
-        return success
+    if not isinstance(
+        data["seen"], list
+    ):
+        data["seen"] = []
 
-    except Exception as exc:
-        log("WeChat push failed:", type(exc).__name__)
-        return False
-
-
-def load():
-    if STATE.exists():
-        data = json.loads(
-            STATE.read_text(encoding="utf-8")
-        )
-
-        if isinstance(data, dict):
-            return data
-
-    return {}
+    return data
 
 
-def save(state):
-    temp = STATE.with_suffix(".tmp")
+def save_state(state):
+    temp = Path("state.tmp")
 
     temp.write_text(
         json.dumps(
@@ -118,172 +254,336 @@ def save(state):
         encoding="utf-8",
     )
 
-    temp.replace(STATE)
+    temp.replace(STATE_FILE)
 
 
-def word_addr(word):
+def decode_address(value):
     return Web3.to_checksum_address(
-        "0x" + word[-40:]
+        "0x" + value[-40:]
     )
 
 
-def events_for(start, end):
-    logs = rpc(
+def scan_events(start, end):
+    result = rpc(
         "eth_getLogs",
         [{
             "fromBlock": hex(start),
             "toBlock": hex(end),
             "address": FACTORY_V3,
-            "topics": [TOPIC],
+            "topics": [POOL_TOPIC],
         }],
     )
 
     events = []
 
-    for item in logs:
+    for item in result:
         try:
             topics = item["topics"]
-            raw = item["data"].removeprefix("0x")
 
-            if len(topics) != 4 or len(raw) < 128:
+            if len(topics) != 4:
                 continue
 
-            pool = word_addr(raw[64:128])
+            raw = item["data"].removeprefix(
+                "0x"
+            )
+
+            if len(raw) < 128:
+                continue
+
+            pool = decode_address(
+                raw[64:128]
+            )
+
+            tx = item[
+                "transactionHash"
+            ]
+
+            index = int(
+                item["logIndex"], 16
+            )
+
+            block = int(
+                item["blockNumber"], 16
+            )
 
             events.append({
                 "id": (
-                    item["transactionHash"].lower()
+                    tx.lower()
                     + ":"
-                    + str(int(item["logIndex"], 16))
+                    + str(index)
                 ),
                 "pool": pool,
-                "token0": word_addr(topics[1]),
-                "token1": word_addr(topics[2]),
-                "block": int(
-                    item["blockNumber"], 16
+                "token0": decode_address(
+                    topics[1]
                 ),
-                "first_seen": int(time.time()),
+                "token1": decode_address(
+                    topics[2]
+                ),
+                "block": block,
+                "first_seen": int(
+                    time.time()
+                ),
             })
 
-        except (KeyError, ValueError, TypeError) as exc:
-            log("Invalid event", type(exc).__name__)
+        except Exception as exc:
+            log(
+                "Event decode error:",
+                type(exc).__name__,
+            )
 
     return events
 
 
-def market(pool):
+def fetch_pair(pool):
+    url = (
+        "https://api.dexscreener.com/"
+        "latest/dex/pairs/robinhood/"
+        + pool
+    )
+
     try:
-        response = SESSION.get(
-            "https://api.dexscreener.com/latest/dex/pairs/robinhood/"
-            + pool,
-            timeout=20,
+        response = session.get(
+            url,
+            timeout=TIMEOUT,
         )
 
         response.raise_for_status()
 
-        pairs = response.json().get("pairs") or []
+        data = response.json()
 
-        return next(
-            (
-                pair for pair in pairs
-                if str(
-                    pair.get("pairAddress", "")
-                ).lower() == pool.lower()
-            ),
-            None,
-        )
+        pairs = data.get("pairs") or []
+
+        for pair in pairs:
+            if (
+                str(
+                    pair.get(
+                        "pairAddress", ""
+                    )
+                ).lower()
+                == pool.lower()
+            ):
+                return pair
 
     except Exception as exc:
         log(
-            "Market lookup unavailable",
+            "Market API error:",
             type(exc).__name__,
         )
-        return None
+
+    return None
 
 
-def qualifies(pair):
+def evaluate(pair):
     try:
         liquidity = float(
-            (pair.get("liquidity") or {}).get("usd")
-            or 0
+            (
+                pair.get("liquidity")
+                or {}
+            ).get("usd") or 0
         )
 
         volume = float(
-            (pair.get("volume") or {}).get("h24")
-            or 0
+            (
+                pair.get("volume")
+                or {}
+            ).get("h24") or 0
         )
 
         txns = (
-            (pair.get("txns") or {}).get("h24")
+            (
+                pair.get("txns")
+                or {}
+            ).get("h24")
             or {}
         )
 
-        buys = int(txns.get("buys") or 0)
-        sells = int(txns.get("sells") or 0)
+        buys = int(
+            txns.get("buys") or 0
+        )
+
+        sells = int(
+            txns.get("sells") or 0
+        )
 
         created = int(
-            pair.get("pairCreatedAt") or 0
+            pair.get(
+                "pairCreatedAt"
+            ) or 0
         )
+
+        if not created:
+            return None
 
         age = (
-            (time.time() * 1000 - created) / 3600000
-            if created else 999999
+            time.time() * 1000
+            - created
+        ) / 3600000
+
+        if liquidity < MIN_LIQUIDITY:
+            return None
+
+        if volume < MIN_VOLUME:
+            return None
+
+        if buys + sells < MIN_TXNS:
+            return None
+
+        if sells <= 0:
+            return None
+
+        if buys / sells < 0.8:
+            return None
+
+        if volume / max(
+            liquidity, 1
+        ) > 5:
+            return None
+
+        if not (
+            0 <= age <= MAX_AGE_HOURS
+        ):
+            return None
+
+        return {
+            "liquidity": liquidity,
+            "volume": volume,
+            "buys": buys,
+            "sells": sells,
+            "age": age,
+        }
+
+    except (
+        TypeError,
+        ValueError,
+        ZeroDivisionError,
+    ):
+        return None
+
+
+def format_message(event, pair, info):
+    token = (
+        pair.get("baseToken")
+        or {}
+    )
+
+    symbol = token.get(
+        "symbol", "?"
+    )
+
+    title = (
+        "Robinhood候选币："
+        + str(symbol)
+    )
+
+    body = "\n".join([
+        "代币：" + str(
+            token.get("name", "?")
+        ),
+        "合约：" + str(
+            token.get("address", "")
+        ),
+        "交易池：" + event["pool"],
+        "流动性：$"
+        + format(
+            info["liquidity"], ",.0f"
+        ),
+        "24h成交量：$"
+        + format(
+            info["volume"], ",.0f"
+        ),
+        "买入笔数："
+        + str(info["buys"]),
+        "卖出笔数："
+        + str(info["sells"]),
+        "池龄："
+        + format(
+            info["age"], ".1f"
         )
+        + "小时",
+        "区块："
+        + str(event["block"]),
+        "行情："
+        + str(
+            pair.get("url", "")
+        ),
+        "",
+        "仅供候选观察，"
+        "不代表安全或买入建议。",
+        "请核查合约权限、"
+        "持币集中度和LP风险。",
+    ])
 
-        qualified = (
-            liquidity >= 300000
-            and volume >= 100000
-            and buys + sells >= 20
-            and sells > 0
-            and buys / sells >= 0.8
-            and volume / max(liquidity, 1) <= 5
-            and 0 <= age <= 72
-        )
-
-        return qualified, liquidity, volume, age
-
-    except (ValueError, TypeError, ZeroDivisionError):
-        return False, 0, 0, 0
+    return title, body
 
 
 def main():
+    log(
+        "Starting Robinhood Scanner"
+    )
+
     if TEST_PUSH:
-        if not push(
+        success = push(
             "Robinhood扫描器测试",
-            "这是一条测试消息，不是买币信号。",
-        ):
-            raise RuntimeError("Test push failed")
+            "微信测试成功。"
+            "本消息不是买币信号。",
+        )
+
+        if not success:
+            raise RuntimeError(
+                "TEST PUSH FAILED"
+            )
+
+        log("TEST PUSH SUCCESS")
         return
 
-    chain = int(rpc("eth_chainId"), 16)
+    chain = int(
+        rpc("eth_chainId"), 16
+    )
 
     if chain != CHAIN_ID:
         raise RuntimeError(
-            "Wrong chain ID: " + str(chain)
-        )
-
-    code = rpc(
-        "eth_getCode",
-        [FACTORY_V3, "latest"],
-    )
-
-    if code in ("0x", "0x0", None):
-        raise RuntimeError(
-            "V3 factory has no contract bytecode"
+            "Wrong Chain ID: "
+            + str(chain)
         )
 
     latest = int(
-        rpc("eth_blockNumber"), 16
+        rpc("eth_blockNumber"),
+        16,
     )
 
-    state = load()
-    last = state.get("last_block")
-
-    start = (
-        max(0, latest - 299)
-        if last is None
-        else int(last) + 1
+    log(
+        "Connected, latest block:",
+        latest,
     )
+
+    code = rpc(
+        "eth_getCode",
+        [
+            FACTORY_V3,
+            "latest",
+        ],
+    )
+
+    if code in (
+        "0x", "0x0", None
+    ):
+        raise RuntimeError(
+            "Factory contract not found"
+        )
+
+    log("Factory bytecode exists")
+
+    state = load_state()
+
+    last = state["last_block"]
+
+    if last is None:
+        start = max(
+            0,
+            latest - 299,
+        )
+    else:
+        start = int(last) + 1
 
     if start > latest:
         log("No new blocks")
@@ -291,138 +591,187 @@ def main():
     else:
         end = min(
             latest,
-            start + 2999,
+            start
+            + MAX_BLOCKS_PER_RUN
+            - 1,
         )
 
         found = 0
-        pending = state.get("pending", [])
-        seen = set(state.get("seen", []))
+
+        pending = state["pending"]
+
+        seen = set(
+            state["seen"]
+        )
 
         pending_ids = {
-            event["id"]
-            for event in pending
+            e.get("id")
+            for e in pending
+            if isinstance(e, dict)
         }
 
         for block in range(
-            start, end + 1, 50
+            start,
+            end + 1,
+            CHUNK_SIZE,
         ):
             chunk_end = min(
-                block + 49, end
+                block
+                + CHUNK_SIZE
+                - 1,
+                end,
             )
 
-            events = events_for(
-                block, chunk_end
+            events = scan_events(
+                block,
+                chunk_end,
             )
 
             for event in events:
                 if (
-                    event["id"] not in seen
-                    and event["id"] not in pending_ids
+                    event["id"]
+                    not in seen
+                    and event["id"]
+                    not in pending_ids
                 ):
-                    pending.append(event)
-                    pending_ids.add(event["id"])
+                    pending.append(
+                        event
+                    )
+
+                    pending_ids.add(
+                        event["id"]
+                    )
 
             found += len(events)
 
-            state["last_block"] = chunk_end
-            state["pending"] = pending
-            save(state)
+            state["last_block"] = (
+                chunk_end
+            )
+
+            state["pending"] = (
+                pending
+            )
+
+            save_state(state)
+
+            if (
+                (block - start)
+                // CHUNK_SIZE
+            ) % 20 == 0:
+                log(
+                    "Scanned",
+                    block,
+                    "-",
+                    chunk_end,
+                    "events=",
+                    len(events),
+                )
+
+            time.sleep(0.15)
 
         log(
-            "Scanned",
+            "Scan complete:",
             start,
-            "to",
+            "-",
             end,
-            "found events",
+            "events=",
             found,
-            "lag",
+            "lag=",
             latest - end,
         )
+
+    seen = set(
+        state["seen"]
+    )
 
     remaining = []
     pushed = 0
     rejected = 0
     unavailable = 0
 
-    for event in state.get("pending", []):
-        if pushed >= 8:
+    for event in state["pending"]:
+        if pushed >= MAX_PUSHES:
             remaining.append(event)
             continue
 
-        pair = market(event["pool"])
+        pair = fetch_pair(
+            event["pool"]
+        )
 
         if pair is None:
+            unavailable += 1
+
             if (
                 time.time()
-                - event.get("first_seen", 0)
+                - event.get(
+                    "first_seen", 0
+                )
                 < 72 * 3600
             ):
-                remaining.append(event)
+                remaining.append(
+                    event
+                )
             else:
-                seen.add(event["id"])
+                seen.add(
+                    event["id"]
+                )
 
-            unavailable += 1
             continue
 
-        ok, liquidity, volume, age = qualifies(
-            pair
-        )
+        info = evaluate(pair)
 
-        if not ok:
+        if info is None:
+            rejected += 1
+
             if (
                 time.time()
-                - event.get("first_seen", 0)
+                - event.get(
+                    "first_seen", 0
+                )
                 < 24 * 3600
             ):
-                remaining.append(event)
+                remaining.append(
+                    event
+                )
             else:
-                seen.add(event["id"])
+                seen.add(
+                    event["id"]
+                )
 
-            rejected += 1
             continue
 
-        token = pair.get("baseToken") or {}
-
-        title = (
-            "Robinhood候选池："
-            + str(token.get("symbol", "?"))
-        )
-
-        body = (
-            "代币："
-            + str(token.get("name", "?"))
-            + "\n合约："
-            + str(token.get("address", ""))
-            + "\n交易池："
-            + event["pool"]
-            + "\n流动性：$"
-            + format(liquidity, ",.0f")
-            + "\n24h成交量：$"
-            + format(volume, ",.0f")
-            + "\n池龄："
-            + format(age, ".1f")
-            + "小时\n行情："
-            + str(pair.get("url", ""))
-            + "\n仅为候选，未完成合约安全审计。"
+        title, body = (
+            format_message(
+                event,
+                pair,
+                info,
+            )
         )
 
         if push(title, body):
-            seen.add(event["id"])
             pushed += 1
+            seen.add(
+                event["id"]
+            )
         else:
-            remaining.append(event)
+            remaining.append(
+                event
+            )
 
-    state["pending"] = remaining[:3000]
-    state["seen"] = list(seen)[-10000:]
+    state["pending"] = (
+        remaining[-3000:]
+    )
+
+    state["seen"] = (
+        list(seen)[-10000:]
+    )
 
     log(
-        "Summary: pushed",
-        pushed,
-        "rejected",
-        rejected,
-        "market_unavailable",
-        unavailable,
-        "pending",
+        "Summary:",
+        "pushed=", pushed,
+        "rejected=", rejected,
+        "unavailable=", unavailable,
+        "pending=",
         len(remaining),
     )
 
@@ -430,28 +779,46 @@ def main():
         timezone.utc
     ).strftime("%Y-%m-%d")
 
-    if state.get("last_report_day") != today:
-        report = (
-            "扫描正常。链ID：4663"
-            + "\n最新区块："
-            + str(latest)
-            + "\n已扫描至："
-            + str(state.get("last_block"))
-            + "\n待处理池："
-            + str(len(remaining))
-            + "\n本次候选通知："
-            + str(pushed)
-            + "\n注意：仅监控Uniswap V3 Factory，"
-            + "不代表全链覆盖。"
+    if (
+        state.get(
+            "last_report_day"
         )
+        != today
+    ):
+        report = "\n".join([
+            "Robinhood扫描器运行报告",
+            "Chain ID：4663",
+            "最新区块："
+            + str(latest),
+            "已扫描至："
+            + str(
+                state.get(
+                    "last_block"
+                )
+            ),
+            "待处理池："
+            + str(
+                len(remaining)
+            ),
+            "本次推送："
+            + str(pushed),
+            "",
+            "当前仅监控一个"
+            "Uniswap V3 Factory。",
+            "无候选币不代表程序故障。",
+        ])
 
         if push(
-            "Robinhood扫描器每日运行报告",
+            "Robinhood每日运行报告",
             report,
         ):
-            state["last_report_day"] = today
+            state[
+                "last_report_day"
+            ] = today
 
-    save(state)
+    save_state(state)
+
+    log("Run finished successfully")
 
 
 if __name__ == "__main__":
@@ -459,17 +826,10 @@ if __name__ == "__main__":
         main()
 
     except Exception as exc:
-        message = str(exc)[:200]
-
-        if RPC_URL:
-            message = message.replace(
-                RPC_URL, "[RPC]"
-            )
-
         log(
             "FATAL:",
             type(exc).__name__,
-            message,
+            safe_text(exc)[:500],
         )
 
-        raise
+        sys.exit(1)
