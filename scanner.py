@@ -720,7 +720,11 @@ def send_wechat(title, body):
                 timeout=REQUEST_TIMEOUT,
             )
 
-            response.raise_for_status()
+            if response.status_code != 200:
+    log(f"ServerChan HTTP {response.status_code}: {response.text[:500]}")
+    return False
+
+result = response.json()
             result = response.json()
 
             if result.get("code") == 0:
