@@ -42,7 +42,7 @@ jobs:
         env:
           ALCHEMY_RPC_URL: ${{ secrets.ALCHEMY_RPC_URL }}
           SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
-          TEST_PUSH: ${{ vars.TEST_PUSH }}
+          TEST_PUSH: "0"
         run: python scanner.py
 
       - name: Save scanner state
