@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from web3 import Web3
 
 
-# Robinhood Chain Scanner
-# Read-only: never executes trades
+# Robinhood Chain scanner
+# Read only. Never buys or sells tokens.
 
 RPC_URL = os.getenv(
     "ALCHEMY_RPC_URL", ""
@@ -25,55 +25,59 @@ TEST_PUSH = (
     os.getenv("TEST_PUSH", "0") == "1"
 )
 
-STATE_FILE = Path("state.json")
-
 CHAIN_ID = 4663
 
-FACTORY_V3 = (
+FACTORY = (
     "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
 )
 
 POOL_TOPIC = Web3.to_hex(
     Web3.keccak(
-        text=(
-            "PoolCreated("
-            "address,address,uint24,int24,address)"
-        )
+        text="PoolCreated(address,address,uint24,int24,address)"
     )
 )
 
+STATE_FILE = Path("state.json")
+
+# Changing this version starts fresh near the chain tip.
+SCANNER_VERSION = "live-v2"
+
 CHUNK_SIZE = 10
-MAX_BLOCKS_PER_RUN = 3000
+MAX_BLOCKS_PER_RUN = 300
+MAX_BACKLOG = 600
+CONFIRMATIONS = 3
+
+MAX_PENDING = 300
+MAX_PUSHES = 8
 
 MIN_LIQUIDITY = 300000
 MIN_VOLUME = 100000
 MIN_TXNS = 20
 MAX_AGE_HOURS = 72
 
-MAX_PUSHES = 8
 TIMEOUT = 25
 
 session = requests.Session()
 
 
 def log(*args):
-    now = datetime.now(
+    stamp = datetime.now(
         timezone.utc
     ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    print(now, *args, flush=True)
+    print(stamp, *args, flush=True)
 
 
 def safe_text(value):
-    value = str(value)
+    result = str(value)
 
     for secret in (RPC_URL, SEND_KEY):
         if secret:
-            value = value.replace(
+            result = result.replace(
                 secret, "[REDACTED]"
             )
 
-    return value
+    return result
 
 
 def rpc(method, params=None):
@@ -98,15 +102,13 @@ def rpc(method, params=None):
             )
 
             if response.status_code != 200:
-                detail = safe_text(
-                    response.text[:500]
-                )
-
                 log(
-                    "RPC HTTP error",
+                    "RPC HTTP",
                     response.status_code,
                     "method=" + method,
-                    "details=" + detail,
+                    "detail=" + safe_text(
+                        response.text[:250]
+                    ),
                 )
 
                 response.raise_for_status()
@@ -127,18 +129,16 @@ def rpc(method, params=None):
 
         except Exception as exc:
             log(
-                "RPC failed:",
+                "RPC retry",
                 method,
                 type(exc).__name__,
-                safe_text(exc)[:300],
+                safe_text(exc)[:200],
             )
 
             if attempt == 3:
                 raise
 
-            time.sleep(
-                min(2 ** attempt, 8)
-            )
+            time.sleep(2 ** attempt)
 
 
 def push(title, message):
@@ -165,11 +165,8 @@ def push(title, message):
 
             if response.status_code != 200:
                 log(
-                    "ServerChan HTTP",
+                    "WeChat HTTP",
                     response.status_code,
-                    safe_text(
-                        response.text[:300]
-                    ),
                 )
 
                 if response.status_code in (
@@ -187,15 +184,15 @@ def push(title, message):
                 return True
 
             log(
-                "ServerChan error:",
-                safe_text(data)[:300],
+                "WeChat API code:",
+                data.get("code"),
             )
 
             return False
 
         except Exception as exc:
             log(
-                "WeChat error:",
+                "WeChat error",
                 type(exc).__name__,
             )
 
@@ -204,16 +201,19 @@ def push(title, message):
     return False
 
 
-def load_state():
-    default = {
+def default_state():
+    return {
+        "version": SCANNER_VERSION,
         "last_block": None,
         "pending": [],
         "seen": [],
         "last_report_day": None,
     }
 
+
+def load_state():
     if not STATE_FILE.exists():
-        return default
+        return default_state()
 
     data = json.loads(
         STATE_FILE.read_text(
@@ -223,20 +223,24 @@ def load_state():
 
     if not isinstance(data, dict):
         raise RuntimeError(
-            "Invalid state.json"
+            "Invalid state file"
         )
 
-    for key, value in default.items():
+    if data.get("version") != SCANNER_VERSION:
+        log(
+            "Scanner upgraded:",
+            "old historical backlog reset"
+        )
+
+        return default_state()
+
+    for key, value in default_state().items():
         data.setdefault(key, value)
 
-    if not isinstance(
-        data["pending"], list
-    ):
+    if not isinstance(data["pending"], list):
         data["pending"] = []
 
-    if not isinstance(
-        data["seen"], list
-    ):
+    if not isinstance(data["seen"], list):
         data["seen"] = []
 
     return data
@@ -264,54 +268,45 @@ def decode_address(value):
 
 
 def scan_events(start, end):
-    result = rpc(
+    raw_logs = rpc(
         "eth_getLogs",
         [{
             "fromBlock": hex(start),
             "toBlock": hex(end),
-            "address": FACTORY_V3,
+            "address": FACTORY,
             "topics": [POOL_TOPIC],
         }],
     )
 
     events = []
 
-    for item in result:
+    for item in raw_logs:
         try:
             topics = item["topics"]
+            data = item["data"].removeprefix("0x")
 
             if len(topics) != 4:
                 continue
 
-            raw = item["data"].removeprefix(
-                "0x"
-            )
-
-            if len(raw) < 128:
+            if len(data) < 128:
                 continue
 
             pool = decode_address(
-                raw[64:128]
+                data[64:128]
             )
 
-            tx = item[
-                "transactionHash"
-            ]
+            tx = item["transactionHash"]
 
-            index = int(
-                item["logIndex"], 16
-            )
-
-            block = int(
-                item["blockNumber"], 16
+            event_id = (
+                tx.lower()
+                + ":"
+                + str(
+                    int(item["logIndex"], 16)
+                )
             )
 
             events.append({
-                "id": (
-                    tx.lower()
-                    + ":"
-                    + str(index)
-                ),
+                "id": event_id,
                 "pool": pool,
                 "token0": decode_address(
                     topics[1]
@@ -319,15 +314,15 @@ def scan_events(start, end):
                 "token1": decode_address(
                     topics[2]
                 ),
-                "block": block,
-                "first_seen": int(
-                    time.time()
+                "block": int(
+                    item["blockNumber"], 16
                 ),
+                "first_seen": int(time.time()),
             })
 
         except Exception as exc:
             log(
-                "Event decode error:",
+                "Event decode error",
                 type(exc).__name__,
             )
 
@@ -347,54 +342,55 @@ def fetch_pair(pool):
             timeout=TIMEOUT,
         )
 
-        response.raise_for_status()
+        log(
+            "Market HTTP",
+            response.status_code,
+            "pool=" + pool[:12],
+        )
+
+        if response.status_code != 200:
+            return None, "api_error"
 
         data = response.json()
 
         pairs = data.get("pairs") or []
 
         for pair in pairs:
-            if (
-                str(
-                    pair.get(
-                        "pairAddress", ""
-                    )
-                ).lower()
-                == pool.lower()
-            ):
-                return pair
+            address = str(
+                pair.get(
+                    "pairAddress", ""
+                )
+            ).lower()
+
+            if address == pool.lower():
+                return pair, "found"
+
+        return None, "not_listed"
 
     except Exception as exc:
         log(
-            "Market API error:",
+            "Market API error",
             type(exc).__name__,
         )
 
-    return None
+        return None, "api_error"
 
 
 def evaluate(pair):
     try:
         liquidity = float(
-            (
-                pair.get("liquidity")
-                or {}
-            ).get("usd") or 0
+            (pair.get("liquidity") or {})
+            .get("usd") or 0
         )
 
         volume = float(
-            (
-                pair.get("volume")
-                or {}
-            ).get("h24") or 0
+            (pair.get("volume") or {})
+            .get("h24") or 0
         )
 
         txns = (
-            (
-                pair.get("txns")
-                or {}
-            ).get("h24")
-            or {}
+            (pair.get("txns") or {})
+            .get("h24") or {}
         )
 
         buys = int(
@@ -406,17 +402,14 @@ def evaluate(pair):
         )
 
         created = int(
-            pair.get(
-                "pairCreatedAt"
-            ) or 0
+            pair.get("pairCreatedAt") or 0
         )
 
-        if not created:
+        if created <= 0:
             return None
 
         age = (
-            time.time() * 1000
-            - created
+            time.time() * 1000 - created
         ) / 3600000
 
         if liquidity < MIN_LIQUIDITY:
@@ -453,26 +446,22 @@ def evaluate(pair):
         }
 
     except (
-        TypeError,
         ValueError,
+        TypeError,
         ZeroDivisionError,
     ):
         return None
 
 
-def format_message(event, pair, info):
-    token = (
-        pair.get("baseToken")
-        or {}
-    )
+def format_candidate(event, pair, info):
+    token = pair.get("baseToken") or {}
 
-    symbol = token.get(
-        "symbol", "?"
+    symbol = str(
+        token.get("symbol", "?")
     )
 
     title = (
-        "Robinhood候选币："
-        + str(symbol)
+        "Robinhood候选币：" + symbol
     )
 
     body = "\n".join([
@@ -484,56 +473,39 @@ def format_message(event, pair, info):
         ),
         "交易池：" + event["pool"],
         "流动性：$"
-        + format(
-            info["liquidity"], ",.0f"
-        ),
-        "24h成交量：$"
-        + format(
-            info["volume"], ",.0f"
-        ),
-        "买入笔数："
-        + str(info["buys"]),
-        "卖出笔数："
-        + str(info["sells"]),
+        + format(info["liquidity"], ",.0f"),
+        "24小时成交量：$"
+        + format(info["volume"], ",.0f"),
+        "买入笔数：" + str(info["buys"]),
+        "卖出笔数：" + str(info["sells"]),
         "池龄："
-        + format(
-            info["age"], ".1f"
-        )
+        + format(info["age"], ".1f")
         + "小时",
-        "区块："
-        + str(event["block"]),
-        "行情："
-        + str(
+        "区块：" + str(event["block"]),
+        "行情：" + str(
             pair.get("url", "")
         ),
         "",
-        "仅供候选观察，"
-        "不代表安全或买入建议。",
-        "请核查合约权限、"
-        "持币集中度和LP风险。",
+        "仅供观察，不是买入建议。",
+        "尚未核实持仓集中度、"
+        "合约权限和LP安全。",
     ])
 
     return title, body
 
 
 def main():
-    log(
-        "Starting Robinhood Scanner"
-    )
+    log("Starting Robinhood live scanner")
 
     if TEST_PUSH:
-        success = push(
+        if not push(
             "Robinhood扫描器测试",
-            "微信测试成功。"
-            "本消息不是买币信号。",
-        )
-
-        if not success:
+            "测试成功，不是买币信号。",
+        ):
             raise RuntimeError(
                 "TEST PUSH FAILED"
             )
 
-        log("TEST PUSH SUCCESS")
         return
 
     chain = int(
@@ -542,36 +514,32 @@ def main():
 
     if chain != CHAIN_ID:
         raise RuntimeError(
-            "Wrong Chain ID: "
-            + str(chain)
+            "Wrong chain: " + str(chain)
         )
 
     latest = int(
-        rpc("eth_blockNumber"),
-        16,
+        rpc("eth_blockNumber"), 16
     )
 
-    log(
-        "Connected, latest block:",
-        latest,
+    target = max(
+        0, latest - CONFIRMATIONS
     )
 
     code = rpc(
         "eth_getCode",
-        [
-            FACTORY_V3,
-            "latest",
-        ],
+        [FACTORY, "latest"],
     )
 
-    if code in (
-        "0x", "0x0", None
-    ):
+    if code in ("0x", "0x0", None):
         raise RuntimeError(
-            "Factory contract not found"
+            "Factory bytecode missing"
         )
 
-    log("Factory bytecode exists")
+    log(
+        "Connected",
+        "latest=", latest,
+        "target=", target,
+    )
 
     state = load_state()
 
@@ -580,35 +548,50 @@ def main():
     if last is None:
         start = max(
             0,
-            latest - 299,
+            target - MAX_BLOCKS_PER_RUN + 1,
         )
+
+        log(
+            "LIVE MODE INITIALIZED",
+            "start=", start,
+        )
+
     else:
         start = int(last) + 1
 
-    if start > latest:
-        log("No new blocks")
+        backlog = target - int(last)
 
-    else:
+        if backlog > MAX_BACKLOG:
+            old_start = start
+
+            start = max(
+                0,
+                target - MAX_BLOCKS_PER_RUN + 1,
+            )
+
+            log(
+                "BACKLOG SKIPPED",
+                old_start,
+                "to",
+                start - 1,
+            )
+
+    found = 0
+
+    seen = set(state["seen"])
+    pending = state["pending"]
+
+    pending_ids = {
+        e.get("id")
+        for e in pending
+        if isinstance(e, dict)
+    }
+
+    if start <= target:
         end = min(
-            latest,
-            start
-            + MAX_BLOCKS_PER_RUN
-            - 1,
+            target,
+            start + MAX_BLOCKS_PER_RUN - 1,
         )
-
-        found = 0
-
-        pending = state["pending"]
-
-        seen = set(
-            state["seen"]
-        )
-
-        pending_ids = {
-            e.get("id")
-            for e in pending
-            if isinstance(e, dict)
-        }
 
         for block in range(
             start,
@@ -616,9 +599,7 @@ def main():
             CHUNK_SIZE,
         ):
             chunk_end = min(
-                block
-                + CHUNK_SIZE
-                - 1,
+                block + CHUNK_SIZE - 1,
                 end,
             )
 
@@ -627,194 +608,137 @@ def main():
                 chunk_end,
             )
 
+            found += len(events)
+
             for event in events:
                 if (
-                    event["id"]
-                    not in seen
-                    and event["id"]
-                    not in pending_ids
+                    event["id"] not in seen
+                    and event["id"] not in pending_ids
                 ):
-                    pending.append(
-                        event
-                    )
+                    pending.append(event)
 
                     pending_ids.add(
                         event["id"]
                     )
 
-            found += len(events)
-
-            state["last_block"] = (
-                chunk_end
-            )
-
-            state["pending"] = (
-                pending
-            )
+            state["last_block"] = chunk_end
+            state["pending"] = pending
 
             save_state(state)
 
-            if (
-                (block - start)
-                // CHUNK_SIZE
-            ) % 20 == 0:
-                log(
-                    "Scanned",
-                    block,
-                    "-",
-                    chunk_end,
-                    "events=",
-                    len(events),
-                )
-
-            time.sleep(0.15)
+            time.sleep(0.3)
 
         log(
-            "Scan complete:",
-            start,
-            "-",
-            end,
-            "events=",
-            found,
-            "lag=",
-            latest - end,
+            "Scan complete",
+            "start=", start,
+            "end=", end,
+            "events=", found,
+            "lag=", target - end,
         )
 
-    seen = set(
-        state["seen"]
-    )
+    else:
+        log("No new confirmed blocks")
 
-    remaining = []
     pushed = 0
     rejected = 0
-    unavailable = 0
+    not_listed = 0
+    api_errors = 0
 
-    for event in state["pending"]:
+    remaining = []
+
+    now = time.time()
+
+    for event in pending:
         if pushed >= MAX_PUSHES:
             remaining.append(event)
             continue
 
-        pair = fetch_pair(
+        first_seen = float(
+            event.get("first_seen") or now
+        )
+
+        age_seconds = now - first_seen
+
+        if age_seconds > 72 * 3600:
+            seen.add(event["id"])
+            continue
+
+        pair, status = fetch_pair(
             event["pool"]
         )
 
-        if pair is None:
-            unavailable += 1
+        if status == "api_error":
+            api_errors += 1
+            remaining.append(event)
+            continue
 
-            if (
-                time.time()
-                - event.get(
-                    "first_seen", 0
-                )
-                < 72 * 3600
-            ):
-                remaining.append(
-                    event
-                )
-            else:
-                seen.add(
-                    event["id"]
-                )
-
+        if status == "not_listed":
+            not_listed += 1
+            remaining.append(event)
             continue
 
         info = evaluate(pair)
 
         if info is None:
             rejected += 1
-
-            if (
-                time.time()
-                - event.get(
-                    "first_seen", 0
-                )
-                < 24 * 3600
-            ):
-                remaining.append(
-                    event
-                )
-            else:
-                seen.add(
-                    event["id"]
-                )
-
+            remaining.append(event)
             continue
 
-        title, body = (
-            format_message(
-                event,
-                pair,
-                info,
-            )
+        title, body = format_candidate(
+            event,
+            pair,
+            info,
         )
 
         if push(title, body):
             pushed += 1
-            seen.add(
-                event["id"]
-            )
+            seen.add(event["id"])
         else:
-            remaining.append(
-                event
-            )
+            remaining.append(event)
 
-    state["pending"] = (
-        remaining[-3000:]
-    )
+        time.sleep(0.25)
 
-    state["seen"] = (
-        list(seen)[-10000:]
-    )
+    state["pending"] = remaining[:MAX_PENDING]
+    state["seen"] = list(seen)[-10000:]
 
     log(
-        "Summary:",
+        "Summary",
         "pushed=", pushed,
         "rejected=", rejected,
-        "unavailable=", unavailable,
-        "pending=",
-        len(remaining),
+        "not_listed=", not_listed,
+        "api_errors=", api_errors,
+        "pending=", len(state["pending"]),
     )
 
     today = datetime.now(
         timezone.utc
     ).strftime("%Y-%m-%d")
 
-    if (
-        state.get(
-            "last_report_day"
-        )
-        != today
-    ):
+    if state.get("last_report_day") != today:
         report = "\n".join([
-            "Robinhood扫描器运行报告",
-            "Chain ID：4663",
-            "最新区块："
-            + str(latest),
-            "已扫描至："
-            + str(
-                state.get(
-                    "last_block"
-                )
+            "Robinhood实时扫描运行报告",
+            "链ID：4663",
+            "最新区块：" + str(latest),
+            "已扫描至：" + str(
+                state.get("last_block")
             ),
-            "待处理池："
-            + str(
-                len(remaining)
+            "本次发现事件：" + str(found),
+            "待处理池：" + str(
+                len(state["pending"])
             ),
-            "本次推送："
-            + str(pushed),
+            "行情未收录：" + str(not_listed),
+            "行情接口错误：" + str(api_errors),
+            "候选币推送：" + str(pushed),
             "",
-            "当前仅监控一个"
-            "Uniswap V3 Factory。",
-            "无候选币不代表程序故障。",
+            "当前仅监听一个V3 Factory。",
+            "不代表覆盖全链全部新币。",
         ])
 
         if push(
             "Robinhood每日运行报告",
             report,
         ):
-            state[
-                "last_report_day"
-            ] = today
+            state["last_report_day"] = today
 
     save_state(state)
 
@@ -827,9 +751,9 @@ if __name__ == "__main__":
 
     except Exception as exc:
         log(
-            "FATAL:",
+            "FATAL",
             type(exc).__name__,
-            safe_text(exc)[:500],
+            safe_text(exc)[:400],
         )
 
         sys.exit(1)
